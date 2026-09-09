@@ -100,8 +100,8 @@ export async function runAgent(userPrompt: string) {
   throw new Error("Agent exceeded maximum steps");
 }
 
-function truncate(text: string, max: number) {
-  if (text.length <= max) {
+function truncate(text: string | undefined, max: number) {
+  if (!text || text.length <= max) {
     return text;
   }
 

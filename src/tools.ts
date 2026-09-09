@@ -1,5 +1,3 @@
-// src/tools.ts
-
 import fs from "node:fs/promises";
 import path from "node:path";
 import { exec } from "node:child_process";
