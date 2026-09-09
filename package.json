@@ -1,34 +1,39 @@
 {
-  "name": "micro-agent",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "dev": "tsx src/index.ts",
-    "lint": "biome check --write",
-    "prepare": "husky"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "devEngines": {
-    "packageManager": {
-      "name": "pnpm",
-      "version": "12.3.4",
-      "onFail": "download"
-    }
-  },
-  "packageManager": "pnpm@12.3.4",
-  "type": "module",
-  "dependencies": {
-    "dotenv": "^17.4.2",
-    "openai": "^7.10.0"
-  },
-  "devDependencies": {
-    "@biomejs/biome": "2.5.12",
-    "@types/node": "^26.5.0",
-    "husky": "^9.1.7",
-    "tsx": "^4.23.13",
-    "typescript": "^7.0.2"
-  }
+	"name": "micro-agent",
+	"version": "1.0.0",
+	"description": "",
+	"main": "index.js",
+	"scripts": {
+		"dev": "tsx src/index.ts",
+		"lint": "biome check --write",
+		"lint:ci": "biome check",
+		"prepare": "husky"
+	},
+	"lint-staged": {
+		"*.{ts,js,mjs,json}": "biome check --write --no-errors-on-unmatched"
+	},
+	"keywords": [],
+	"author": "",
+	"license": "ISC",
+	"devEngines": {
+		"packageManager": {
+			"name": "pnpm",
+			"version": "12.3.4",
+			"onFail": "download"
+		}
+	},
+	"packageManager": "pnpm@12.3.4",
+	"type": "module",
+	"dependencies": {
+		"dotenv": "^17.4.2",
+		"openai": "^7.10.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.12",
+		"@types/node": "^26.5.0",
+		"husky": "^9.1.7",
+		"lint-staged": "^17.5.0",
+		"tsx": "^4.23.13",
+		"typescript": "^7.0.2"
+	}
 }
