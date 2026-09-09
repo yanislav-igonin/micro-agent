@@ -20,41 +20,25 @@ function resolveInsideRoot(relativePath: string) {
   return fullPath;
 }
 
-async function readFile(args: { path: string }) {
+async function read(args: { path: string }) {
   const fullPath = resolveInsideRoot(args.path);
 
   return fs.readFile(fullPath, "utf8");
 }
 
-async function writeFile(args: { path: string, content: string }) {
+async function write(args: { path: string, content: string }) {
   const fullPath = resolveInsideRoot(args.path);
 
   return fs.writeFile(fullPath, args.content);
 }
 
-async function appendFile(args: { path: string, content: string }) {
+async function edit(args: { path: string, content: string }) {
   const fullPath = resolveInsideRoot(args.path);
 
   return fs.appendFile(fullPath, args.content);
 }
 
-async function listFiles(args: { path: string }) {
-  const fullPath = resolveInsideRoot(args.path);
-
-  const entries = await fs.readdir(fullPath, {
-    withFileTypes: true,
-  });
-
-  return entries
-    .map((entry) =>
-      entry.isDirectory()
-        ? `${entry.name}/`
-        : entry.name,
-    )
-    .join("\n");
-}
-
-async function shell(args: { command: string }) {
+async function run(args: { command: string }) {
   try {
     const { stdout, stderr } = await execAsync(args.command, {
       cwd: ROOT,
@@ -78,7 +62,7 @@ async function shell(args: { command: string }) {
 export const tools = [
   {
     type: "function" as const,
-    name: "read_file",
+    name: "read",
     description: "Read the contents of a text file in the current project",
     parameters: {
       type: "object",
@@ -96,25 +80,7 @@ export const tools = [
 
   {
     type: "function" as const,
-    name: "list_files",
-    description: "List files and directories",
-    parameters: {
-      type: "object",
-      properties: {
-        path: {
-          type: "string",
-          description: "Directory relative to project root",
-        },
-      },
-      required: ["path"],
-      additionalProperties: false,
-    },
-    strict: true,
-  },
-
-  {
-    type: "function" as const,
-    name: "write_file",
+    name: "write",
     description: "Write to a text file in the current project",
     parameters: {
       type: "object",
@@ -136,7 +102,7 @@ export const tools = [
 
   {
     type: "function" as const,
-    name: "append_file",
+    name: "edit",
     description: "Append to a text file in the current project",
     parameters: {
       type: "object",
@@ -158,9 +124,9 @@ export const tools = [
 
   {
     type: "function" as const,
-    name: "shell",
+    name: "run",
     description:
-      "Execute a shell command inside the current project directory",
+      "Execute a shell command",
     parameters: {
       type: "object",
       properties: {
@@ -182,28 +148,23 @@ export async function executeTool(
 ): Promise<string | void> {
   try {
     switch (name) {
-      case "read_file":
-        return await readFile(
+      case "read":
+        return await read(
           args as { path: string },
         );
 
-      case "write_file":
-        return await writeFile(
+      case "write":
+        return await write(
           args as { path: string, content: string },
         );
 
-      case "append_file":
-        return await appendFile(
+      case "edit":
+        return await edit(
           args as { path: string, content: string },
         );
 
-      case "list_files":
-        return await listFiles(
-          args as { path: string },
-        );
-
-      case "shell":
-        return await shell(
+      case "run":
+        return await run(
           args as { command: string },
         );
 
