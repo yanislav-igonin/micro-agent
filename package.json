@@ -5,8 +5,7 @@
 	"main": "index.js",
 	"scripts": {
 		"dev": "tsx src/index.ts",
-		"lint": "biome check --write",
-		"lint:ci": "biome check",
+		"lint": "biome check",
 		"prepare": "husky"
 	},
 	"lint-staged": {
