@@ -13,7 +13,7 @@ const rl = createInterface({
   output,
 });
 
-console.log("Tiny Agent");
+console.log("Micro Agent");
 console.log('Type "exit" to quit.\n');
 
 while (true) {
