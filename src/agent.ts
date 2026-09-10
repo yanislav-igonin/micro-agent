@@ -1,9 +1,13 @@
 import OpenAI from "openai";
-import { executeTool, tools } from "./tools.js";
+import type {
+	Response,
+	ResponseCreateParamsNonStreaming,
+	ResponseInput,
+} from "openai/resources/responses/responses";
+import { type Journal, normalizeError, type StopReason } from "./journal.js";
+import { executeTool, type ToolResult, tools } from "./tools.js";
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+let openai: OpenAI | undefined;
 
 const SYSTEM_PROMPT = `
 You are a small coding agent.
@@ -21,86 +25,113 @@ Do not claim that you inspected something unless you actually used a tool.
 When you have enough information, answer the user.
 `;
 
-export async function runAgent(userPrompt: string) {
-	const input: any[] = [
-		{
-			role: "user",
-			content: userPrompt,
-		},
-	];
+export async function runAgent(
+	userPrompt: string,
+	journal: Journal,
+	requestNumber: number,
+) {
+	const context = { requestNumber };
+	const input: ResponseInput = [{ role: "user", content: userPrompt }];
+	let reason: StopReason = "unexpected_error";
+	let failure: ReturnType<typeof normalizeError> | undefined;
+	await journal.record("user_request_started", { prompt: userPrompt }, context);
+	console.log(`[request ${requestNumber}] started`);
 
-	for (let step = 0; step < 20; step++) {
-		console.log(`\n[agent step ${step + 1}]`);
-
-		const response = await openai.responses.create({
-			model: process.env.OPENAI_MODEL ?? "gpt-5.6-luna",
-			instructions: SYSTEM_PROMPT,
-			tools,
-			input,
-		});
-
-		//
-		// VERY IMPORTANT:
-		//
-		// Everything produced by the model becomes part
-		// of the current agent run's context.
-		//
-		input.push(...response.output);
-
-		const toolCalls = response.output.filter(
-			(item: any) => item.type === "function_call",
-		);
-
-		//
-		// No tool calls = model decided it is finished.
-		//
-		if (toolCalls.length === 0) {
-			return response.output_text;
-		}
-
-		//
-		// Execute every requested tool.
-		//
-		for (const call of toolCalls) {
-			console.log(`[tool] ${call.name}(${call.arguments})`);
-
-			let args: unknown;
-
+	try {
+		for (let stepNumber = 1; stepNumber <= 20; stepNumber++) {
+			const stepContext = { requestNumber, stepNumber };
+			console.log(`[request ${requestNumber} step ${stepNumber}] started`);
+			const request: ResponseCreateParamsNonStreaming = {
+				model: process.env.OPENAI_MODEL ?? "gpt-5.6-luna",
+				instructions: SYSTEM_PROMPT,
+				tools,
+				input,
+			};
+			await journal.record("model_request", request, stepContext);
+			let response: Response;
 			try {
-				args = JSON.parse(call.arguments);
-			} catch {
-				args = {};
+				// Initialize after the journal so configuration failures are recorded too.
+				openai ??= new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+				response = await openai.responses.create(request);
+			} catch (error) {
+				reason = "model_error";
+				await journal.record("model_error", normalizeError(error), stepContext);
+				throw error;
+			}
+			await journal.record("model_response", response, stepContext);
+
+			// Replay every output item, including reasoning items, on the next step.
+			// SDK 7.10.0 gives AdditionalTools incompatible input/output roles.
+			// Responses replay requires preserving the returned items unchanged.
+			input.push(...(response.output as ResponseInput));
+			const toolCalls = response.output.filter(
+				(item) => item.type === "function_call",
+			);
+			if (toolCalls.length === 0) {
+				reason = "final_answer";
+				return response.output_text;
 			}
 
-			const result = await executeTool(call.name, args);
+			for (const call of toolCalls) {
+				const toolContext = { ...stepContext, callId: call.call_id };
+				await journal.record(
+					"tool_started",
+					{ name: call.name, arguments: call.arguments },
+					toolContext,
+				);
+				console.log(`[tool ${call.name}] started`);
+				let args: unknown;
+				let result: ToolResult;
+				let phase = "argument_parsing";
+				try {
+					args = JSON.parse(call.arguments);
+				} catch (error) {
+					result = {
+						status: "error",
+						output: "ERROR: Invalid tool arguments",
+						error: normalizeError(error),
+					};
+					await journal.record(
+						"tool_finished",
+						{ name: call.name, phase, ...result },
+						toolContext,
+					);
+					console.log(`[tool ${call.name}] error`);
+					input.push({
+						type: "function_call_output",
+						call_id: call.call_id,
+						output: result.output,
+					});
+					continue;
+				}
 
-			console.log(`[tool result] ${truncate(result, 300)}`);
-
-			//
-			// THIS IS THE CRITICAL PART.
-			//
-			// We send the result of our JS function
-			// back to the model.
-			//
-			input.push({
-				type: "function_call_output",
-				call_id: call.call_id,
-				output: result,
-			});
+				phase = "execution";
+				result = await executeTool(call.name, args);
+				await journal.record(
+					"tool_finished",
+					{ name: call.name, arguments: args, phase, ...result },
+					toolContext,
+				);
+				console.log(`[tool ${call.name}] ${result.status}`);
+				// The original call_id connects this local result to the model's call.
+				input.push({
+					type: "function_call_output",
+					call_id: call.call_id,
+					output: result.output,
+				});
+			}
 		}
+		reason = "max_steps";
+		throw new Error("Agent exceeded maximum steps");
+	} catch (error) {
+		failure = normalizeError(error);
+		throw error;
+	} finally {
+		await journal.record(
+			"user_request_finished",
+			{ reason, ...(failure ? { error: failure } : {}) },
+			context,
+		);
+		console.log(`[request ${requestNumber}] stop: ${reason}`);
 	}
-
-	throw new Error("Agent exceeded maximum steps");
 }
-
-function truncate(text: string | undefined, max: number) {
-	if (!text || text.length <= max) {
-		return text;
-	}
-
-	return text.slice(0, max) + "...";
-}
-
-// test line
-
-// test line
