@@ -6,7 +6,7 @@
 	"scripts": {
 		"dev": "tsx src/index.ts",
 		"lint": "biome check",
-		"test": "vitest run",
+		"test": "vitest run --root .",
 		"viewer": "vite",
 		"prepare": "husky"
 	},
