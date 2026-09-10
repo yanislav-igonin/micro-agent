@@ -2,6 +2,7 @@ import { exec } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { normalizeError } from "./journal.js";
 
 const execAsync = promisify(exec);
 
@@ -36,24 +37,12 @@ async function edit(args: { path: string; content: string }) {
 }
 
 async function run(args: { command: string }) {
-	try {
-		const { stdout, stderr } = await execAsync(args.command, {
-			cwd: ROOT,
-			timeout: 10_000,
-			maxBuffer: 1024 * 1024,
-		});
-
-		return JSON.stringify({
-			stdout,
-			stderr,
-		});
-	} catch (error: any) {
-		return JSON.stringify({
-			error: error.message,
-			stdout: error.stdout ?? "",
-			stderr: error.stderr ?? "",
-		});
-	}
+	const { stdout, stderr } = await execAsync(args.command, {
+		cwd: ROOT,
+		timeout: 10_000,
+		maxBuffer: 1024 * 1024,
+	});
+	return JSON.stringify({ stdout, stderr });
 }
 
 export const tools = [
@@ -138,28 +127,64 @@ export const tools = [
 	},
 ];
 
+export type ToolResult =
+	| { status: "ok"; output: string }
+	| {
+			status: "error";
+			output: string;
+			error: ReturnType<typeof normalizeError>;
+	  };
+
 export async function executeTool(
 	name: string,
 	args: unknown,
-): Promise<string | void> {
+): Promise<ToolResult> {
 	try {
+		if (!args || typeof args !== "object" || Array.isArray(args)) {
+			throw new Error("Tool arguments must be an object");
+		}
+		let output: string | undefined;
 		switch (name) {
 			case "read":
-				return await read(args as { path: string });
-
 			case "write":
-				return await write(args as { path: string; content: string });
-
-			case "edit":
-				return await edit(args as { path: string; content: string });
-
+			case "edit": {
+				if (!("path" in args) || typeof args.path !== "string") {
+					throw new Error("Tool argument path must be a string");
+				}
+				if (name === "read") {
+					output = await read({ path: args.path });
+				} else {
+					if (!("content" in args) || typeof args.content !== "string") {
+						throw new Error("Tool argument content must be a string");
+					}
+					const fileArgs = { path: args.path, content: args.content };
+					if (name === "write") await write(fileArgs);
+					else await edit(fileArgs);
+				}
+				break;
+			}
 			case "run":
-				return await run(args as { command: string });
-
+				if (!("command" in args) || typeof args.command !== "string") {
+					throw new Error("Tool argument command must be a string");
+				}
+				output = await run({ command: args.command });
+				break;
 			default:
-				return `ERROR: Unknown tool: ${name}`;
+				throw new Error(`Unknown tool: ${name}`);
 		}
-	} catch (error: any) {
-		return `ERROR: ${error.message}`;
+		return { status: "ok", output: output ?? "OK" };
+	} catch (error) {
+		const normalized = normalizeError(error);
+		const fields = error && typeof error === "object" ? error : {};
+		// A failed shell command still has useful stdout/stderr; keep both in full.
+		const output =
+			"stdout" in fields || "stderr" in fields
+				? `ERROR: ${JSON.stringify({
+						error: normalized.message,
+						stdout: "stdout" in fields ? fields.stdout : "",
+						stderr: "stderr" in fields ? fields.stderr : "",
+					})}`
+				: `ERROR: ${normalized.message}`;
+		return { status: "error", output, error: normalized };
 	}
 }

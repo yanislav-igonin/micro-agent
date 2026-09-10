@@ -4,6 +4,11 @@ import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
 
 import { runAgent } from "./agent.js";
+import { createJournal } from "./journal.js";
+
+const journal = await createJournal(!process.argv.includes("--no-log"));
+await journal.record("cli_started", {});
+let requestNumber = 0;
 
 const rl = createInterface({
 	input,
@@ -25,12 +30,15 @@ while (true) {
 	}
 
 	try {
-		const answer = await runAgent(prompt);
+		const answer = await runAgent(prompt, journal, ++requestNumber);
 
 		console.log(`\n${answer}\n`);
-	} catch (error) {
-		console.error(error);
+	} catch {
+		console.error(
+			"Request failed; see stop reason above and journal for details.",
+		);
 	}
 }
 
 rl.close();
+await journal.record("cli_finished", { requestCount: requestNumber });
