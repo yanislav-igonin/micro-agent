@@ -6,6 +6,8 @@
 	"scripts": {
 		"dev": "tsx src/index.ts",
 		"lint": "biome check",
+		"test": "vitest run",
+		"viewer": "vite",
 		"prepare": "husky"
 	},
 	"lint-staged": {
@@ -25,14 +27,21 @@
 	"type": "module",
 	"dependencies": {
 		"dotenv": "^17.4.2",
-		"openai": "^7.10.0"
+		"openai": "^7.10.0",
+		"react": "^19.3.0",
+		"react-dom": "^19.3.0"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.5.12",
 		"@types/node": "^26.5.0",
+		"@types/react": "^19.3.0",
+		"@types/react-dom": "^19.3.0",
+		"@vitejs/plugin-react": "^6.1.1",
 		"husky": "^9.1.7",
 		"lint-staged": "^17.5.0",
 		"tsx": "^4.23.13",
-		"typescript": "^7.0.2"
+		"typescript": "^7.0.2",
+		"vite": "^8.2.2",
+		"vitest": "^5.0.0"
 	}
 }
