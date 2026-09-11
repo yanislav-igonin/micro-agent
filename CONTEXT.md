@@ -5,7 +5,16 @@ Micro Agent exposes the work of a small coding agent as a sequence of inspectabl
 ## Language
 
 **Run**:
-One lifetime of the Micro Agent CLI process. A run can contain multiple user requests.
+One lifetime of the Micro Agent CLI process. A run contains exactly one conversation.
+_Avoid_: Session
+
+**Conversation**:
+The ordered model-visible exchange between the user and agent during one run. It includes every user request, model response, and tool interaction in that run.
+_Avoid_: Agent context, chat session
+
+**User Request**:
+One user message and the agent activity it starts within a conversation.
+_Avoid_: Prompt, standalone context
 
 **Journal**:
 The ordered record of agent activity produced during one run.
