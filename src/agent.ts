@@ -25,13 +25,21 @@ Do not claim that you inspected something unless you actually used a tool.
 When you have enough information, answer the user.
 `;
 
-export async function runAgent(
+export function createAgent() {
+	const input: ResponseInput = [];
+
+	return (userPrompt: string, journal: Journal, requestNumber: number) =>
+		runAgent(input, userPrompt, journal, requestNumber);
+}
+
+async function runAgent(
+	input: ResponseInput,
 	userPrompt: string,
 	journal: Journal,
 	requestNumber: number,
 ) {
 	const context = { requestNumber };
-	const input: ResponseInput = [{ role: "user", content: userPrompt }];
+	input.push({ role: "user", content: userPrompt });
 	let reason: StopReason = "unexpected_error";
 	let failure: ReturnType<typeof normalizeError> | undefined;
 	await journal.record("user_request_started", { prompt: userPrompt }, context);

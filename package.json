@@ -7,8 +7,7 @@
 		"dev": "tsx src/index.ts",
 		"lint": "biome check",
 		"test": "vitest run --root .",
-		"viewer": "vite",
-		"prepare": "husky"
+		"viewer": "vite"
 	},
 	"lint-staged": {
 		"*.{ts,js,mjs,json}": "biome check --write --no-errors-on-unmatched"

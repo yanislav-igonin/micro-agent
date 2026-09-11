@@ -4,7 +4,8 @@ A small TypeScript CLI coding agent using the OpenAI Responses API.
 
 Use `pnpm@12.3.4`. Install with `pnpm install`, copy `.env.example` to `.env`,
 set `OPENAI_API_KEY`, then run `pnpm dev`. `OPENAI_MODEL` overrides the default
-model. Type `exit` or `quit` to finish. Each prompt starts a separate agent context.
+model. Type `exit` or `quit` to finish. Each CLI launch keeps one conversation, so
+follow-up prompts can refer to earlier messages and tool results from that launch.
 
 ## Work journal
 
@@ -66,7 +67,7 @@ jq 'select(.type == "user_request_finished") | {requestNumber, data}' logs/<file
 
 ## Verification
 
-Run `pnpm exec tsc --noEmit` and `pnpm lint`. There is no automated test framework.
+Run `pnpm test`, `pnpm exec tsc --noEmit`, and `pnpm lint`.
 Exercise CLI behavior in a disposable project: ask it to read/write a sample file,
 then try a missing file or failing shell command, send a second prompt, and quit.
 Check JSON parsing, sequence order, matching call IDs, separate request numbers,

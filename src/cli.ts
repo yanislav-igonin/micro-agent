@@ -1,4 +1,4 @@
-import { runAgent } from "./agent.js";
+import { createAgent } from "./agent.js";
 import type { Journal } from "./journal.js";
 
 interface CliPrompt {
@@ -16,7 +16,7 @@ interface SignalSource {
 export async function runCli(
 	rl: CliPrompt,
 	journal: Journal,
-	agent = runAgent,
+	agent = createAgent(),
 	signals: SignalSource = process,
 ) {
 	let requestNumber = 0;
