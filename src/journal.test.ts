@@ -43,4 +43,37 @@ describe("createJournal", () => {
 			"cli_finished",
 		]);
 	});
+
+	it("records conversation context only on conversation events", async () => {
+		const root = await fs.mkdtemp(
+			path.join(os.tmpdir(), "micro-agent-journal-"),
+		);
+		roots.push(root);
+		const journal = await createJournal(true, root);
+
+		await journal.record("cli_started", {});
+		await journal.record(
+			"model_request",
+			{ input: [] },
+			{ conversationId: "a1b2c3d4e5f6", requestNumber: 1, stepNumber: 1 },
+		);
+		await journal.finish({ requestCount: 1 });
+
+		const [filename] = await fs.readdir(path.join(root, "logs"));
+		const events = (
+			await fs.readFile(path.join(root, "logs", filename ?? ""), "utf8")
+		)
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+
+		expect(events[0]).not.toHaveProperty("conversationId");
+		expect(events[1]).toMatchObject({
+			type: "model_request",
+			conversationId: "a1b2c3d4e5f6",
+			requestNumber: 1,
+			stepNumber: 1,
+		});
+		expect(events[2]).not.toHaveProperty("conversationId");
+	});
 });

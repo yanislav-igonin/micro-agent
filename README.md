@@ -13,9 +13,10 @@ Each CLI launch creates one `logs/<UTC-timestamp>-<pid>.jsonl` file and prints i
 absolute path. Run `pnpm dev --no-log` to disable file logging explicitly.
 
 Each line is an independent JSON event with `schemaVersion: 1`, `sequence`, UTC
-`timestamp`, `type`, `runId`, and `data`. `requestNumber`, `stepNumber`, and `callId`
-appear where applicable. Sequence numbers cover the whole launch; request numbers
-start at 1, and step numbers restart at 1 for each prompt.
+`timestamp`, `type`, `runId`, and `data`. `conversationId`, `requestNumber`,
+`stepNumber`, and `callId` appear where applicable. Run-level events remain
+conversation-neutral. Sequence numbers cover the whole launch; request numbers start
+at 1, and step numbers restart at 1 for each prompt.
 
 The normal sequence is:
 
@@ -43,9 +44,9 @@ returned to the model and allow the cycle to continue, including shell failures
 with their stdout and stderr preserved.
 
 `user_request_finished.data.reason` is `final_answer`, `max_steps`, `model_error`,
-or `unexpected_error`. `cancelled` is reserved; signal handling is not implemented.
-An API failure emits `model_error` before finishing the request. Missing finish
-events indicate an interrupted action or incomplete journal. No repair is attempted.
+`unexpected_error`, or `cancelled`. SIGINT aborts an active model request. An API
+failure emits `model_error` before finishing the request. Missing finish events
+indicate an interrupted action or incomplete journal. No repair is attempted.
 
 The terminal shows progress, tool statuses, stop reasons, and the final answer.
 Full diagnostic arguments and results stay in the journal. On the first journal
@@ -57,6 +58,20 @@ Git. Journals are sensitive, unencrypted local files: file contents, commands,
 and their outputs are preserved without heuristic secret masking. API client
 configuration, environment variables and authorization headers are not serialized.
 There is no automatic cleanup or rotation.
+
+## Conversation checkpoints
+
+Each CLI launch starts with a new empty conversation. Before its first model call,
+the CLI creates `conversations/<id>.json` and records the pending request. It records
+tool status before and after execution, then atomically commits the exact Responses
+input only after a final answer. Failed or interrupted requests leave the previous
+checkpoint intact and are never replayed automatically.
+
+If the final checkpoint cannot be saved, the CLI prints `UNSAVED`, retains the
+advanced input in memory, and blocks later requests until the same checkpoint saves.
+`--no-log` and journal failures do not disable required conversation persistence.
+Conversation files are local, sensitive, unencrypted, ignored by Git, and use the
+same `0700` directory and `0600` file permissions as journals.
 
 Inspect a journal with standard JSON tools, for example:
 

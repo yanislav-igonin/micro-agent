@@ -4,9 +4,11 @@ import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
 
 import { runCli } from "./cli.js";
+import { createConversationStore } from "./conversations.js";
 import { createJournal } from "./journal.js";
 
 const journal = await createJournal(!process.argv.includes("--no-log"));
+const conversationStore = await createConversationStore();
 await journal.record("cli_started", {});
 
 const rl = createInterface({
@@ -17,7 +19,7 @@ const rl = createInterface({
 console.log("Micro Agent");
 console.log('Type "exit" or press Ctrl-C to quit.\n');
 
-const result = await runCli(rl, journal);
+const result = await runCli(rl, journal, conversationStore);
 if (result.interrupted) {
 	process.exit(130);
 }

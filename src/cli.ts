@@ -1,4 +1,5 @@
-import { createAgent } from "./agent.js";
+import { type AgentResult, createAgent } from "./agent.js";
+import type { ConversationStore } from "./conversations.js";
 import type { Journal } from "./journal.js";
 
 interface CliPrompt {
@@ -16,20 +17,30 @@ interface SignalSource {
 export async function runCli(
 	rl: CliPrompt,
 	journal: Journal,
-	agent = createAgent(),
+	conversationStore: ConversationStore,
+	createAgentForInput = createAgent,
 	signals: SignalSource = process,
 ) {
 	let requestNumber = 0;
+	let stopping = false;
+	let activeRequest: AbortController | undefined;
+	let conversation = conversationStore.createConversation();
+	const agent = createAgentForInput(conversation.input);
+	let unsaved: AgentResult | undefined;
 	let interrupt: () => void = () => {};
 	const interrupted = new Promise<true>((resolve) => {
-		interrupt = () => resolve(true);
+		interrupt = () => {
+			stopping = true;
+			activeRequest?.abort();
+			resolve(true);
+		};
 	});
 
 	rl.once("SIGINT", interrupt);
 	signals.once("SIGINT", interrupt);
 
 	const promptLoop = async () => {
-		while (true) {
+		while (!stopping) {
 			const prompt = (await rl.question("agent> ")).trim();
 
 			if (!prompt) {
@@ -37,19 +48,79 @@ export async function runCli(
 			}
 
 			if (prompt === "exit" || prompt === "quit") {
+				if (unsaved) {
+					console.error(
+						"WARNING: UNSAVED conversation checkpoint will be lost on exit.",
+					);
+				}
 				return false;
 			}
 
-			try {
-				const answer = await agent(prompt, journal, ++requestNumber);
+			if (unsaved) {
+				try {
+					conversation = await conversationStore.commitCheckpoint(
+						conversation,
+						unsaved.input,
+						unsaved.model,
+					);
+					unsaved = undefined;
+				} catch {
+					console.error(
+						"UNSAVED: checkpoint persistence still fails; request was not started.",
+					);
+					continue;
+				}
+			}
 
-				console.log(`\n${answer}\n`);
-			} catch {
-				console.error(
-					"Request failed; see stop reason above and journal for details.",
+			const controller = new AbortController();
+			activeRequest = controller;
+			requestNumber++;
+			try {
+				conversation = await conversationStore.startRequest(
+					conversation,
+					prompt,
 				);
+				const result = await agent(prompt, journal, requestNumber, {
+					conversationId: conversation.id,
+					signal: controller.signal,
+					onToolStarted: async (tool) => {
+						conversation = await conversationStore.markToolStarted(
+							conversation,
+							tool,
+						);
+					},
+					onToolFinished: async (callId) => {
+						conversation = await conversationStore.markToolFinished(
+							conversation,
+							callId,
+						);
+					},
+				});
+
+				console.log(`\n${result.answer}\n`);
+				try {
+					conversation = await conversationStore.commitCheckpoint(
+						conversation,
+						result.input,
+						result.model,
+					);
+				} catch {
+					unsaved = result;
+					console.error(
+						"UNSAVED: final checkpoint persistence failed; later work is blocked.",
+					);
+				}
+			} catch {
+				if (!stopping) {
+					console.error(
+						"Request failed; checkpoint was not advanced. See the journal for details.",
+					);
+				}
+			} finally {
+				activeRequest = undefined;
 			}
 		}
+		return true;
 	};
 
 	let wasInterrupted: boolean;
