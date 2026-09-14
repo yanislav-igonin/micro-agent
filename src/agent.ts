@@ -22,23 +22,60 @@ You can:
 Use tools whenever needed to answer the user's request.
 Do not claim that you inspected something unless you actually used a tool.
 
+Tool outputs restored from an earlier CLI run describe historical project state.
+Reread relevant files before modifying them or relying on their contents.
+
 When you have enough information, answer the user.
 `;
 
-export function createAgent() {
-	const input: ResponseInput = [];
+export interface AgentRunOptions {
+	conversationId?: string;
+	signal?: AbortSignal;
+	onToolStarted?: (tool: { callId: string; name: string }) => Promise<void>;
+	onToolFinished?: (callId: string) => Promise<void>;
+}
 
-	return (userPrompt: string, journal: Journal, requestNumber: number) =>
-		runAgent(input, userPrompt, journal, requestNumber);
+export interface AgentResult {
+	answer: string;
+	input: ResponseInput;
+	model: string;
+}
+
+export function createAgent(restoredInput: ResponseInput = []) {
+	let checkpointInput = structuredClone(restoredInput);
+
+	return async (
+		userPrompt: string,
+		journal: Journal,
+		requestNumber: number,
+		options: AgentRunOptions = {},
+	) => {
+		const result = await runAgent(
+			checkpointInput,
+			userPrompt,
+			journal,
+			requestNumber,
+			options,
+		);
+		checkpointInput = structuredClone(result.input);
+		return result;
+	};
 }
 
 async function runAgent(
-	input: ResponseInput,
+	checkpointInput: ResponseInput,
 	userPrompt: string,
 	journal: Journal,
 	requestNumber: number,
+	options: AgentRunOptions,
 ) {
-	const context = { requestNumber };
+	const input = structuredClone(checkpointInput);
+	const context = {
+		...(options.conversationId
+			? { conversationId: options.conversationId }
+			: {}),
+		requestNumber,
+	};
 	input.push({ role: "user", content: userPrompt });
 	let reason: StopReason = "unexpected_error";
 	let failure: ReturnType<typeof normalizeError> | undefined;
@@ -47,26 +84,39 @@ async function runAgent(
 
 	try {
 		for (let stepNumber = 1; stepNumber <= 20; stepNumber++) {
-			const stepContext = { requestNumber, stepNumber };
+			options.signal?.throwIfAborted();
+			const contextualStep = { ...context, stepNumber };
 			console.log(`[request ${requestNumber} step ${stepNumber}] started`);
+			const model = process.env.OPENAI_MODEL ?? "gpt-5.6-luna";
 			const request: ResponseCreateParamsNonStreaming = {
-				model: process.env.OPENAI_MODEL ?? "gpt-5.6-luna",
+				model,
 				instructions: SYSTEM_PROMPT,
 				tools,
 				input,
 			};
-			await journal.record("model_request", request, stepContext);
+			await journal.record("model_request", request, contextualStep);
 			let response: Response;
 			try {
 				// Initialize after the journal so configuration failures are recorded too.
 				openai ??= new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-				response = await openai.responses.create(request);
+				response = await openai.responses.create(request, {
+					signal: options.signal,
+				});
 			} catch (error) {
+				if (options.signal?.aborted) {
+					reason = "cancelled";
+					throw error;
+				}
 				reason = "model_error";
-				await journal.record("model_error", normalizeError(error), stepContext);
+				await journal.record(
+					"model_error",
+					normalizeError(error),
+					contextualStep,
+				);
 				throw error;
 			}
-			await journal.record("model_response", response, stepContext);
+			options.signal?.throwIfAborted();
+			await journal.record("model_response", response, contextualStep);
 
 			// Replay every output item, including reasoning items, on the next step.
 			// SDK 7.10.0 gives AdditionalTools incompatible input/output roles.
@@ -77,11 +127,15 @@ async function runAgent(
 			);
 			if (toolCalls.length === 0) {
 				reason = "final_answer";
-				return response.output_text;
+				return {
+					answer: response.output_text,
+					input: structuredClone(input),
+					model,
+				};
 			}
 
 			for (const call of toolCalls) {
-				const toolContext = { ...stepContext, callId: call.call_id };
+				const toolContext = { ...contextualStep, callId: call.call_id };
 				await journal.record(
 					"tool_started",
 					{ name: call.name, arguments: call.arguments },
@@ -114,7 +168,14 @@ async function runAgent(
 				}
 
 				phase = "execution";
+				options.signal?.throwIfAborted();
+				await options.onToolStarted?.({
+					callId: call.call_id,
+					name: call.name,
+				});
+				options.signal?.throwIfAborted();
 				result = await executeTool(call.name, args);
+				await options.onToolFinished?.(call.call_id);
 				await journal.record(
 					"tool_finished",
 					{ name: call.name, arguments: args, phase, ...result },
@@ -132,6 +193,7 @@ async function runAgent(
 		reason = "max_steps";
 		throw new Error("Agent exceeded maximum steps");
 	} catch (error) {
+		if (options.signal?.aborted) reason = "cancelled";
 		failure = normalizeError(error);
 		throw error;
 	} finally {

@@ -21,6 +21,7 @@ export type JournalEvent =
 	| "cli_finished";
 
 export interface EventContext {
+	conversationId?: string;
 	requestNumber?: number;
 	stepNumber?: number;
 	callId?: string;

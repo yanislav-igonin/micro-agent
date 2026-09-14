@@ -1,6 +1,5 @@
-import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Journal } from "./journal.js";
 
@@ -14,164 +13,350 @@ vi.mock("openai", () => ({
 	},
 }));
 
-import { runCli } from "./cli.js";
+import { createAgent } from "./agent.js";
 
-function journalWith(records: Array<{ type: string; data: unknown }>) {
+const artifacts: string[] = [];
+
+function assistantMessage(id: string, text: string) {
 	return {
-		record: async (type: string, data: unknown) => {
-			records.push({ type, data: structuredClone(data) });
+		id,
+		type: "message" as const,
+		status: "completed" as const,
+		role: "assistant" as const,
+		content: [
+			{
+				type: "output_text" as const,
+				text,
+				annotations: [],
+				logprobs: [],
+			},
+		],
+	};
+}
+
+function journalWith(
+	records: Array<{ type: string; data: unknown; context: unknown }> = [],
+) {
+	return {
+		record: async (type: string, data: unknown, context: unknown) => {
+			records.push({
+				type,
+				data: structuredClone(data),
+				context: structuredClone(context),
+			});
 		},
 		finish: async () => {},
 	} as unknown as Journal;
 }
 
-function promptWith(answers: string[]) {
-	return Object.assign(new EventEmitter(), {
-		question: vi.fn(async () => answers.shift() ?? "quit"),
-		close: vi.fn(),
-	});
-}
+beforeEach(() => {
+	openai.create.mockReset();
+});
 
-describe("runCli", () => {
-	it("keeps complete history after a failed tool turn within one CLI run", async () => {
-		const firstReasoning = {
-			id: "reasoning-1",
-			type: "reasoning",
-			summary: [],
-		};
-		const firstCall = {
-			type: "function_call",
+afterEach(async () => {
+	delete process.env.OPENAI_MODEL;
+	await Promise.all(
+		artifacts.splice(0).map((artifact) => fs.rm(artifact, { force: true })),
+	);
+});
+
+describe("createAgent", () => {
+	it("continues restored input with current runtime configuration", async () => {
+		process.env.OPENAI_MODEL = "current-model";
+		const restoredAnswer = assistantMessage("message-old", "old answer");
+		const restoredInput = [
+			{ role: "user" as const, content: "old request" },
+			restoredAnswer,
+		];
+		const nextAnswer = assistantMessage("message-new", "new answer");
+		const records: Array<{ type: string; data: unknown; context: unknown }> =
+			[];
+		let seenRequest: unknown;
+		openai.create.mockImplementation(async (request) => {
+			seenRequest = structuredClone(request);
+			return {
+				output: [nextAnswer],
+				output_text: "new answer",
+			};
+		});
+
+		const result = await createAgent(restoredInput)(
+			"new request",
+			journalWith(records),
+			1,
+			{ conversationId: "a1b2c3d4e5f6" },
+		);
+
+		const expectedInput = [
+			...restoredInput,
+			{ role: "user", content: "new request" },
+			nextAnswer,
+		];
+		expect(openai.create).toHaveBeenCalledOnce();
+		expect(seenRequest).toMatchObject({
+			model: "current-model",
+			input: expectedInput.slice(0, -1),
+		});
+		expect(seenRequest).toMatchObject({
+			instructions: expect.stringContaining("historical project state"),
+		});
+		expect(result).toEqual({
+			answer: "new answer",
+			input: expectedInput,
+			model: "current-model",
+		});
+		expect(restoredInput).toEqual([
+			{ role: "user", content: "old request" },
+			restoredAnswer,
+		]);
+		expect(records.map(({ context }) => context)).toEqual([
+			{ conversationId: "a1b2c3d4e5f6", requestNumber: 1 },
+			{
+				conversationId: "a1b2c3d4e5f6",
+				requestNumber: 1,
+				stepNumber: 1,
+			},
+			{
+				conversationId: "a1b2c3d4e5f6",
+				requestNumber: 1,
+				stepNumber: 1,
+			},
+			{ conversationId: "a1b2c3d4e5f6", requestNumber: 1 },
+		]);
+	});
+
+	it("discards failed working input before the next user request", async () => {
+		const restoredInput = [{ role: "user" as const, content: "stable" }];
+		const call = {
+			type: "function_call" as const,
 			name: "read",
 			arguments: JSON.stringify({ path: "README.md" }),
 			call_id: "call-1",
 		};
-		const firstAnswer = {
-			id: "message-1",
-			type: "message",
-			status: "completed",
-			role: "assistant",
-			content: [
-				{
-					type: "output_text",
-					text: "first answer",
-					annotations: [],
-					logprobs: [],
-				},
-			],
-		};
-		const failedReasoning = {
-			id: "reasoning-2",
-			type: "reasoning",
-			summary: [],
-		};
-		const failedCall = {
-			type: "function_call",
-			name: "read",
-			arguments: "{",
-			call_id: "call-2",
-		};
-		const thirdAnswer = {
-			id: "message-3",
-			type: "message",
-			status: "completed",
-			role: "assistant",
-			content: [
-				{
-					type: "output_text",
-					text: "third answer",
-					annotations: [],
-					logprobs: [],
-				},
-			],
-		};
-		const freshAnswer = {
-			id: "message-fresh",
-			type: "message",
-			status: "completed",
-			role: "assistant",
-			content: [
-				{
-					type: "output_text",
-					text: "fresh answer",
-					annotations: [],
-					logprobs: [],
-				},
-			],
-		};
+		const finalAnswer = assistantMessage("message-final", "recovered");
 		const seenInputs: unknown[] = [];
-		const usesPreviousResponseId: boolean[] = [];
 		openai.create.mockImplementation(async (request) => {
 			seenInputs.push(structuredClone(request.input));
-			usesPreviousResponseId.push("previous_response_id" in request);
-			const callNumber = seenInputs.length;
-			if (callNumber === 1) {
-				return { output: [firstReasoning, firstCall], output_text: "" };
+			if (seenInputs.length === 1) {
+				return { output: [call], output_text: "" };
 			}
-			if (callNumber === 2) {
-				return { output: [firstAnswer], output_text: "first answer" };
-			}
-			if (callNumber === 3) {
-				return { output: [failedReasoning, failedCall], output_text: "" };
-			}
-			if (callNumber === 4) {
+			if (seenInputs.length === 2) {
 				throw new Error("model failed");
 			}
-			if (callNumber === 5) {
-				return { output: [thirdAnswer], output_text: "third answer" };
-			}
-			return { output: [freshAnswer], output_text: "fresh answer" };
+			return { output: [finalAnswer], output_text: "recovered" };
+		});
+		const agent = createAgent(restoredInput);
+
+		await expect(
+			agent("failed request", journalWith(), 1, {
+				conversationId: "a1b2c3d4e5f6",
+				onToolStarted: async () => {},
+				onToolFinished: async () => {},
+			}),
+		).rejects.toThrow("model failed");
+		await agent("fresh request", journalWith(), 2, {
+			conversationId: "a1b2c3d4e5f6",
 		});
 
-		const records: Array<{ type: string; data: unknown }> = [];
-		const journal = journalWith(records);
-		await runCli(
-			promptWith(["first", "second", "third", "quit"]),
-			journal,
-			undefined,
-			new EventEmitter(),
-		);
-
-		const toolOutput = (callId: string, output: string) => ({
-			type: "function_call_output",
-			call_id: callId,
-			output,
-		});
-		const readme = await fs.readFile("README.md", "utf8");
-		const historyAfterFirst = [
-			{ role: "user", content: "first" },
-			firstReasoning,
-			firstCall,
-			toolOutput("call-1", readme),
-			firstAnswer,
-		];
-		const historyAfterFailure = [
-			...historyAfterFirst,
-			{ role: "user", content: "second" },
-			failedReasoning,
-			failedCall,
-			toolOutput("call-2", "ERROR: Invalid tool arguments"),
-		];
-
-		expect(seenInputs).toEqual([
-			[{ role: "user", content: "first" }],
-			historyAfterFirst.slice(0, -1),
-			[...historyAfterFirst, { role: "user", content: "second" }],
-			historyAfterFailure,
-			[...historyAfterFailure, { role: "user", content: "third" }],
+		expect(seenInputs[0]).toEqual([
+			...restoredInput,
+			{ role: "user", content: "failed request" },
 		]);
-		expect(usesPreviousResponseId).toEqual([false, false, false, false, false]);
+		expect(seenInputs[1]).toEqual([
+			...restoredInput,
+			{ role: "user", content: "failed request" },
+			call,
+			{
+				type: "function_call_output",
+				call_id: "call-1",
+				output: await fs.readFile("README.md", "utf8"),
+			},
+		]);
+		expect(seenInputs[2]).toEqual([
+			...restoredInput,
+			{ role: "user", content: "fresh request" },
+		]);
+	});
 
-		const modelRequestInputs = records
-			.filter(({ type }) => type === "model_request")
-			.map(({ data }) => (data as { input: unknown }).input);
-		expect(modelRequestInputs).toEqual(seenInputs);
+	it("cancels an active model request without advancing its checkpoint", async () => {
+		const controller = new AbortController();
+		const agent = createAgent([{ role: "user", content: "stable" }]);
+		const records: Array<{ type: string; data: unknown; context: unknown }> =
+			[];
+		let freshRequestInput: unknown;
+		openai.create
+			.mockImplementationOnce(async (_request, options) => {
+				if (!options?.signal) throw new Error("missing abort signal");
+				return new Promise((_, reject) => {
+					options.signal.addEventListener(
+						"abort",
+						() => reject(options.signal.reason),
+						{ once: true },
+					);
+				});
+			})
+			.mockImplementationOnce(async (request) => {
+				freshRequestInput = structuredClone(request.input);
+				return {
+					output: [assistantMessage("message-fresh", "fresh")],
+					output_text: "fresh",
+				};
+			});
 
-		await runCli(
-			promptWith(["fresh", "quit"]),
-			journal,
-			undefined,
-			new EventEmitter(),
+		const interrupted = agent("interrupted", journalWith(records), 1, {
+			conversationId: "a1b2c3d4e5f6",
+			signal: controller.signal,
+		});
+		const interruptedExpectation =
+			expect(interrupted).rejects.toThrow("interrupted");
+		await vi.waitFor(() => expect(openai.create).toHaveBeenCalledOnce());
+		controller.abort(new Error("interrupted"));
+
+		await interruptedExpectation;
+		expect(records.at(-1)?.data).toMatchObject({ reason: "cancelled" });
+		await agent("fresh", journalWith(), 2, {
+			conversationId: "a1b2c3d4e5f6",
+		});
+		expect(freshRequestInput).toEqual([
+			{ role: "user", content: "stable" },
+			{ role: "user", content: "fresh" },
+		]);
+	});
+
+	it("awaits tool state around execution", async () => {
+		const artifact = `.checkpoint-test-${process.pid}.txt`;
+		artifacts.push(artifact);
+		const call = {
+			type: "function_call" as const,
+			name: "write",
+			arguments: JSON.stringify({ path: artifact, content: "written" }),
+			call_id: "call-write",
+		};
+		openai.create
+			.mockResolvedValueOnce({ output: [call], output_text: "" })
+			.mockResolvedValueOnce({
+				output: [assistantMessage("message-done", "done")],
+				output_text: "done",
+			});
+		const order: string[] = [];
+
+		await createAgent()("write it", journalWith(), 1, {
+			conversationId: "a1b2c3d4e5f6",
+			onToolStarted: async (tool) => {
+				order.push(`started:${tool.callId}:${tool.name}`);
+				await expect(fs.access(artifact)).rejects.toThrow();
+			},
+			onToolFinished: async (callId) => {
+				order.push(`finished:${callId}`);
+				expect(await fs.readFile(artifact, "utf8")).toBe("written");
+			},
+		});
+
+		expect(order).toEqual(["started:call-write:write", "finished:call-write"]);
+	});
+
+	it("does not execute a tool when its started callback fails", async () => {
+		const artifact = `.checkpoint-blocked-${process.pid}.txt`;
+		artifacts.push(artifact);
+		openai.create.mockResolvedValue({
+			output: [
+				{
+					type: "function_call",
+					name: "write",
+					arguments: JSON.stringify({ path: artifact, content: "forbidden" }),
+					call_id: "call-blocked",
+				},
+			],
+			output_text: "",
+		});
+
+		await expect(
+			createAgent()("write it", journalWith(), 1, {
+				conversationId: "a1b2c3d4e5f6",
+				onToolStarted: async () => {
+					throw new Error("state save failed");
+				},
+			}),
+		).rejects.toThrow("state save failed");
+
+		await expect(fs.access(artifact)).rejects.toThrow();
+		expect(openai.create).toHaveBeenCalledOnce();
+	});
+
+	it("does not execute a tool when interrupted during its started callback", async () => {
+		const artifact = `.checkpoint-interrupted-${process.pid}.txt`;
+		artifacts.push(artifact);
+		const controller = new AbortController();
+		let finishStartedSave = () => {};
+		const onToolStarted = vi.fn(
+			() =>
+				new Promise<void>((resolve) => {
+					finishStartedSave = resolve;
+				}),
 		);
-		expect(seenInputs.at(-1)).toEqual([{ role: "user", content: "fresh" }]);
+		openai.create.mockResolvedValue({
+			output: [
+				{
+					type: "function_call",
+					name: "write",
+					arguments: JSON.stringify({ path: artifact, content: "forbidden" }),
+					call_id: "call-interrupted",
+				},
+			],
+			output_text: "",
+		});
+
+		const interrupted = createAgent()("write it", journalWith(), 1, {
+			conversationId: "a1b2c3d4e5f6",
+			signal: controller.signal,
+			onToolStarted,
+		});
+		const interruptedExpectation =
+			expect(interrupted).rejects.toThrow("interrupted");
+		await vi.waitFor(() => expect(onToolStarted).toHaveBeenCalledOnce());
+		controller.abort(new Error("interrupted"));
+		finishStartedSave();
+
+		await interruptedExpectation;
+		await expect(fs.access(artifact)).rejects.toThrow();
+	});
+
+	it("stops after execution when finished state cannot be saved", async () => {
+		const artifact = `.checkpoint-finished-${process.pid}.txt`;
+		artifacts.push(artifact);
+		const call = {
+			type: "function_call" as const,
+			name: "write",
+			arguments: JSON.stringify({ path: artifact, content: "written" }),
+			call_id: "call-finished",
+		};
+		let freshRequestInput: unknown;
+		openai.create
+			.mockResolvedValueOnce({ output: [call], output_text: "" })
+			.mockImplementationOnce(async (request) => {
+				freshRequestInput = structuredClone(request.input);
+				return {
+					output: [assistantMessage("message-fresh", "fresh")],
+					output_text: "fresh",
+				};
+			});
+		const agent = createAgent();
+
+		await expect(
+			agent("failed", journalWith(), 1, {
+				conversationId: "a1b2c3d4e5f6",
+				onToolStarted: async () => {},
+				onToolFinished: async () => {
+					throw new Error("state save failed");
+				},
+			}),
+		).rejects.toThrow("state save failed");
+		expect(await fs.readFile(artifact, "utf8")).toBe("written");
+		expect(openai.create).toHaveBeenCalledOnce();
+
+		await agent("fresh", journalWith(), 2, {
+			conversationId: "a1b2c3d4e5f6",
+		});
+		expect(freshRequestInput).toEqual([{ role: "user", content: "fresh" }]);
 	});
 });
