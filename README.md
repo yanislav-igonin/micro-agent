@@ -45,15 +45,27 @@ to the model. Successful write/append operations return `OK`. Tool errors are
 returned to the model and allow the cycle to continue, including shell failures
 with their stdout and stderr preserved.
 
+Each tool execution has two output representations. `tool_finished.data.output`
+keeps the complete captured result for diagnosis, while
+`tool_finished.data.modelOutput` is the bounded representation appended to model
+input and saved in conversation checkpoints. Truncation metadata records the
+strategy and exact shown and omitted character counts. With `--no-log`, omitted
+raw content is not recoverable.
+
+`read` returns at most 200 lines and 20,000 Unicode characters. Its header reports
+one-based line/column coordinates and an exact `next` position. `run` keeps small
+results exact; large model-visible results contain the first and last 10,000
+characters around an omission marker. `replace` edits a file only when its literal
+`oldText` occurs exactly once.
+
 `user_request_finished.data.reason` is `final_answer`, `max_steps`, `model_error`,
 `unexpected_error`, or `cancelled`. SIGINT aborts an active model request. An API
 failure emits `model_error` before finishing the request. Missing finish events
 indicate an interrupted action or incomplete journal. No repair is attempted.
 
 The terminal shows progress, tool statuses, stop reasons, and the final answer.
-Full diagnostic arguments and results stay in the journal. On the first journal
-creation or write failure, one warning appears and logging stays disabled for
-that launch; the agent continues.
+On the first journal creation or write failure, one warning appears and logging
+stays disabled for that launch; the agent continues.
 
 `logs/` has Unix mode `0700`; files have mode `0600`. The directory is ignored by
 Git. Journals are sensitive, unencrypted local files: file contents, commands,

@@ -1015,7 +1015,7 @@ git commit -m "feat(tools): add exact text replacement"
 - Consumes: completed PRI-294 behavior from Tasks 1-3.
 - Produces: user-facing documentation and fresh full-suite verification evidence.
 
-- [ ] **Step 1: Update Journal and tool-output documentation**
+- [x] **Step 1: Update Journal and tool-output documentation**
 
 Replace the README sentence claiming full results merely “stay in the journal” with an explicit two-representation contract. Add this paragraph after the description of `tool_finished`:
 
@@ -1036,7 +1036,7 @@ characters around an omission marker. `replace` edits a file only when its liter
 
 Keep the existing security warning that Journals may contain file contents, commands, and outputs.
 
-- [ ] **Step 2: Run the complete automated verification**
+- [x] **Step 2: Run the complete automated verification**
 
 Run each command separately and require exit code 0:
 
@@ -1049,7 +1049,7 @@ git diff --check
 
 Expected baseline: at least the existing 76 tests plus the new PRI-294 tests pass; TypeScript reports no errors; Biome reports no errors; Git reports no whitespace errors.
 
-- [ ] **Step 3: Inspect the implementation diff against scope**
+- [x] **Step 3: Inspect the implementation diff against scope**
 
 Run:
 
@@ -1069,7 +1069,7 @@ Verify manually from the diff:
 - replacement validation completes before `fs.writeFile`;
 - only the shared PRI-82 branch is active.
 
-- [ ] **Step 4: Commit the documentation**
+- [x] **Step 4: Commit the documentation**
 
 ```bash
 git add README.md
