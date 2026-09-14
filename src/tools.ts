@@ -7,6 +7,63 @@ import { normalizeError } from "./journal.js";
 const execAsync = promisify(exec);
 
 const ROOT = process.cwd();
+const MODEL_OUTPUT_CHARACTERS = 20_000;
+const MODEL_OUTPUT_EDGE_CHARACTERS = 10_000;
+
+export interface ToolOutputTruncation {
+	strategy: "none" | "head_tail" | "range";
+	truncated: boolean;
+	originalCharacters: number;
+	shownCharacters: number;
+	omittedCharacters: number;
+}
+
+interface PreparedToolOutput {
+	output: string;
+	modelOutput: string;
+	truncation: ToolOutputTruncation;
+}
+
+function exactOutput(output: string): PreparedToolOutput {
+	const characters = Array.from(output).length;
+	return {
+		output,
+		modelOutput: output,
+		truncation: {
+			strategy: "none",
+			truncated: false,
+			originalCharacters: characters,
+			shownCharacters: characters,
+			omittedCharacters: 0,
+		},
+	};
+}
+
+export function prepareBoundedOutput(output: string): PreparedToolOutput {
+	const characters = Array.from(output);
+	if (characters.length <= MODEL_OUTPUT_CHARACTERS) return exactOutput(output);
+
+	const omittedCharacters =
+		characters.length - MODEL_OUTPUT_EDGE_CHARACTERS * 2;
+	const head = characters.slice(0, MODEL_OUTPUT_EDGE_CHARACTERS).join("");
+	const tail = characters.slice(-MODEL_OUTPUT_EDGE_CHARACTERS).join("");
+	const modelOutput =
+		`[tool_output original_chars=${characters.length} shown_chars=20000 ` +
+		`omitted_chars=${omittedCharacters} truncated=true]\n` +
+		`${head}\n[... omitted ${omittedCharacters} chars ...]\n${tail}`;
+
+	return {
+		output,
+		modelOutput,
+		truncation: {
+			strategy: "head_tail",
+			truncated: true,
+			originalCharacters: characters.length,
+			shownCharacters: MODEL_OUTPUT_CHARACTERS,
+			omittedCharacters,
+		},
+	};
+}
 
 function resolveInsideRoot(relativePath: string) {
 	const fullPath = path.resolve(ROOT, relativePath);
@@ -21,19 +78,21 @@ function resolveInsideRoot(relativePath: string) {
 async function read(args: { path: string }) {
 	const fullPath = resolveInsideRoot(args.path);
 
-	return fs.readFile(fullPath, "utf8");
+	return prepareBoundedOutput(await fs.readFile(fullPath, "utf8"));
 }
 
 async function write(args: { path: string; content: string }) {
 	const fullPath = resolveInsideRoot(args.path);
 
-	return fs.writeFile(fullPath, args.content);
+	await fs.writeFile(fullPath, args.content);
+	return exactOutput("OK");
 }
 
 async function edit(args: { path: string; content: string }) {
 	const fullPath = resolveInsideRoot(args.path);
 
-	return fs.appendFile(fullPath, args.content);
+	await fs.appendFile(fullPath, args.content);
+	return exactOutput("OK");
 }
 
 async function run(args: { command: string }) {
@@ -42,7 +101,7 @@ async function run(args: { command: string }) {
 		timeout: 10_000,
 		maxBuffer: 1024 * 1024,
 	});
-	return JSON.stringify({ stdout, stderr });
+	return prepareBoundedOutput(JSON.stringify({ stdout, stderr }));
 }
 
 export const tools = [
@@ -127,13 +186,25 @@ export const tools = [
 	},
 ];
 
-export type ToolResult =
-	| { status: "ok"; output: string }
-	| {
-			status: "error";
-			output: string;
-			error: ReturnType<typeof normalizeError>;
-	  };
+export type ToolResult = PreparedToolOutput &
+	(
+		| { status: "ok" }
+		| {
+				status: "error";
+				error: ReturnType<typeof normalizeError>;
+		  }
+	);
+
+export function createToolErrorResult(
+	output: string,
+	error: unknown,
+): ToolResult {
+	return {
+		status: "error",
+		...prepareBoundedOutput(output),
+		error: normalizeError(error),
+	};
+}
 
 export async function executeTool(
 	name: string,
@@ -143,36 +214,39 @@ export async function executeTool(
 		if (!args || typeof args !== "object" || Array.isArray(args)) {
 			throw new Error("Tool arguments must be an object");
 		}
-		let output: string | undefined;
+		let prepared: PreparedToolOutput;
 		switch (name) {
-			case "read":
+			case "read": {
+				if (!("path" in args) || typeof args.path !== "string") {
+					throw new Error("Tool argument path must be a string");
+				}
+				prepared = await read({ path: args.path });
+				break;
+			}
 			case "write":
 			case "edit": {
 				if (!("path" in args) || typeof args.path !== "string") {
 					throw new Error("Tool argument path must be a string");
 				}
-				if (name === "read") {
-					output = await read({ path: args.path });
-				} else {
-					if (!("content" in args) || typeof args.content !== "string") {
-						throw new Error("Tool argument content must be a string");
-					}
-					const fileArgs = { path: args.path, content: args.content };
-					if (name === "write") await write(fileArgs);
-					else await edit(fileArgs);
+				if (!("content" in args) || typeof args.content !== "string") {
+					throw new Error("Tool argument content must be a string");
 				}
+				const fileArgs = { path: args.path, content: args.content };
+				prepared =
+					name === "write" ? await write(fileArgs) : await edit(fileArgs);
 				break;
 			}
-			case "run":
+			case "run": {
 				if (!("command" in args) || typeof args.command !== "string") {
 					throw new Error("Tool argument command must be a string");
 				}
-				output = await run({ command: args.command });
+				prepared = await run({ command: args.command });
 				break;
+			}
 			default:
 				throw new Error(`Unknown tool: ${name}`);
 		}
-		return { status: "ok", output: output ?? "OK" };
+		return { status: "ok", ...prepared };
 	} catch (error) {
 		const normalized = normalizeError(error);
 		const fields = error && typeof error === "object" ? error : {};
@@ -185,6 +259,6 @@ export async function executeTool(
 						stderr: "stderr" in fields ? fields.stderr : "",
 					})}`
 				: `ERROR: ${normalized.message}`;
-		return { status: "error", output, error: normalized };
+		return createToolErrorResult(output, error);
 	}
 }

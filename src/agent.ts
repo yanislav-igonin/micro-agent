@@ -5,7 +5,12 @@ import type {
 	ResponseInput,
 } from "openai/resources/responses/responses";
 import { type Journal, normalizeError, type StopReason } from "./journal.js";
-import { executeTool, type ToolResult, tools } from "./tools.js";
+import {
+	createToolErrorResult,
+	executeTool,
+	type ToolResult,
+	tools,
+} from "./tools.js";
 
 let openai: OpenAI | undefined;
 
@@ -148,11 +153,10 @@ async function runAgent(
 				try {
 					args = JSON.parse(call.arguments);
 				} catch (error) {
-					result = {
-						status: "error",
-						output: "ERROR: Invalid tool arguments",
-						error: normalizeError(error),
-					};
+					result = createToolErrorResult(
+						"ERROR: Invalid tool arguments",
+						error,
+					);
 					await journal.record(
 						"tool_finished",
 						{ name: call.name, phase, ...result },
@@ -162,7 +166,7 @@ async function runAgent(
 					input.push({
 						type: "function_call_output",
 						call_id: call.call_id,
-						output: result.output,
+						output: result.modelOutput,
 					});
 					continue;
 				}
@@ -186,7 +190,7 @@ async function runAgent(
 				input.push({
 					type: "function_call_output",
 					call_id: call.call_id,
-					output: result.output,
+					output: result.modelOutput,
 				});
 			}
 		}

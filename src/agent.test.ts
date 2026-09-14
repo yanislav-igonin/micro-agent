@@ -359,4 +359,52 @@ describe("createAgent", () => {
 		});
 		expect(freshRequestInput).toEqual([{ role: "user", content: "fresh" }]);
 	});
+
+	it("journals raw tool output but sends only bounded output to the model", async () => {
+		const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+			`process.stdout.write("a".repeat(10001) + "z".repeat(10000))`,
+		)}`;
+		const call = {
+			type: "function_call" as const,
+			name: "run",
+			arguments: JSON.stringify({ command }),
+			call_id: "call-large-run",
+		};
+		const records: Array<{ type: string; data: unknown; context: unknown }> =
+			[];
+		let secondRequestInput: unknown[] = [];
+		openai.create
+			.mockResolvedValueOnce({ output: [call], output_text: "" })
+			.mockImplementationOnce(async (request) => {
+				secondRequestInput = structuredClone(request.input);
+				return {
+					output: [assistantMessage("message-done", "done")],
+					output_text: "done",
+				};
+			});
+
+		await createAgent()("run it", journalWith(records), 1, {
+			onToolStarted: async () => {},
+			onToolFinished: async () => {},
+		});
+
+		const finished = records.find(({ type }) => type === "tool_finished");
+		const data = finished?.data as {
+			output: string;
+			modelOutput: string;
+			truncation: { truncated: boolean; omittedCharacters: number };
+		};
+		const sent = secondRequestInput.find(
+			(item) =>
+				typeof item === "object" &&
+				item !== null &&
+				"type" in item &&
+				item.type === "function_call_output",
+		) as { output: string };
+
+		expect(data.output.length).toBeGreaterThan(20_000);
+		expect(data.truncation.truncated).toBe(true);
+		expect(sent.output).toBe(data.modelOutput);
+		expect(sent.output).not.toBe(data.output);
+	});
 });

@@ -39,7 +39,7 @@
 - Produces: `ToolOutputTruncation`, `ToolResult.output`, `ToolResult.modelOutput`, `ToolResult.truncation`, and `createToolErrorResult(output, error)`.
 - Invariant: `output` is raw Journal data; only `modelOutput` may enter a `function_call_output` item.
 
-- [ ] **Step 1: Add failing pure output-boundary tests**
+- [x] **Step 1: Add failing pure output-boundary tests**
 
 Create `src/tools.test.ts` with direct tests for exact small output, Unicode code-point counting, and head/tail truncation:
 
@@ -98,7 +98,7 @@ describe("prepareBoundedOutput", () => {
 });
 ```
 
-- [ ] **Step 2: Add a failing agent routing test**
+- [x] **Step 2: Add a failing agent routing test**
 
 The existing hoisted `responses.create` mock already suffices. Add this case to `src/agent.test.ts`:
 
@@ -151,7 +151,7 @@ it("journals raw tool output but sends only bounded output to the model", async 
 });
 ```
 
-- [ ] **Step 3: Run the focused tests and verify the red state**
+- [x] **Step 3: Run the focused tests and verify the red state**
 
 Run:
 
@@ -161,7 +161,7 @@ pnpm test src/tools.test.ts src/agent.test.ts
 
 Expected: `src/tools.test.ts` fails because `prepareBoundedOutput` is missing; the new agent assertion fails because `ToolResult` has only raw `output` and the model receives it unchanged.
 
-- [ ] **Step 4: Add the explicit result envelope and generic bounder**
+- [x] **Step 4: Add the explicit result envelope and generic bounder**
 
 In `src/tools.ts`, add these constants and types near the existing `ROOT` constant:
 
@@ -337,7 +337,7 @@ const output =
 return createToolErrorResult(output, error);
 ```
 
-- [ ] **Step 5: Route raw and bounded fields in the agent loop**
+- [x] **Step 5: Route raw and bounded fields in the agent loop**
 
 Update the import in `src/agent.ts`:
 
@@ -366,7 +366,7 @@ input.push({
 });
 ```
 
-- [ ] **Step 6: Run focused tests and verify green state**
+- [x] **Step 6: Run focused tests and verify green state**
 
 Run:
 
@@ -376,7 +376,7 @@ pnpm test src/tools.test.ts src/agent.test.ts
 
 Expected: all focused tests pass; existing checkpoint and tool-callback tests remain green.
 
-- [ ] **Step 7: Commit the result-envelope boundary**
+- [x] **Step 7: Commit the result-envelope boundary**
 
 ```bash
 git add src/tools.ts src/tools.test.ts src/agent.ts src/agent.test.ts
