@@ -3,6 +3,28 @@ import { type AgentResult, createAgent } from "./agent.js";
 import type { ConversationState, ConversationStore } from "./conversations.js";
 import type { Journal } from "./journal.js";
 
+const CONTEXT_BUDGET_ERROR =
+	"MICRO_AGENT_CONTEXT_BUDGET must be a positive safe integer";
+
+export function parseContextBudget(value: string | undefined) {
+	if (value === undefined) return undefined;
+	if (!/^[1-9]\d*$/.test(value)) throw new Error(CONTEXT_BUDGET_ERROR);
+	const budget = Number(value);
+	if (!Number.isSafeInteger(budget)) throw new Error(CONTEXT_BUDGET_ERROR);
+	return budget;
+}
+
+export function formatAgentPrompt(
+	inputTokens: number | undefined,
+	budget: number | undefined,
+) {
+	if (inputTokens === undefined) return "agent> ";
+	const count = inputTokens.toLocaleString("en-US");
+	if (budget === undefined) return `agent [context ${count}]> `;
+	const percentage = Math.round((inputTokens / budget) * 100);
+	return `agent [context ${count}/${budget.toLocaleString("en-US")} · ${percentage}%]> `;
+}
+
 interface CliPrompt {
 	question(query: string): Promise<string>;
 	pause(): void;
@@ -52,6 +74,7 @@ export async function runCli(
 	signals: SignalSource = process,
 	selectConversation: ConversationSelector = selectSavedConversation,
 	currentModel = process.env.OPENAI_MODEL ?? "gpt-5.6-luna",
+	contextBudget = parseContextBudget(process.env.MICRO_AGENT_CONTEXT_BUDGET),
 ) {
 	let requestNumber = 0;
 	let stopping = false;
@@ -59,6 +82,7 @@ export async function runCli(
 	let conversation = conversationStore.createConversation();
 	let agent = createAgentForInput(conversation.input);
 	let unsaved: AgentResult | undefined;
+	let latestInputTokens: number | undefined;
 	let interrupt: () => void = () => {};
 	const interrupted = new Promise<true>((resolve) => {
 		interrupt = () => {
@@ -73,7 +97,9 @@ export async function runCli(
 
 	const promptLoop = async () => {
 		while (!stopping) {
-			const prompt = (await rl.question("agent> ")).trim();
+			const prompt = (
+				await rl.question(formatAgentPrompt(latestInputTokens, contextBudget))
+			).trim();
 
 			if (!prompt) {
 				continue;
@@ -107,6 +133,7 @@ export async function runCli(
 			if (prompt === "/new") {
 				conversation = conversationStore.createConversation();
 				agent = createAgentForInput(conversation.input);
+				latestInputTokens = undefined;
 				continue;
 			}
 
@@ -150,6 +177,7 @@ export async function runCli(
 					const loadedAgent = createAgentForInput(loadedConversation.input);
 					conversation = loadedConversation;
 					agent = loadedAgent;
+					latestInputTokens = undefined;
 					if (loadedConversation.pendingRequest) {
 						console.error(
 							`WARNING: incomplete request was not resumed: ${loadedConversation.pendingRequest.prompt}`,

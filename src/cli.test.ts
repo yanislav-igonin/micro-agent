@@ -6,7 +6,7 @@ import type { ResponseInput } from "openai/resources/responses/responses";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AgentRunOptions } from "./agent.js";
-import { runCli } from "./cli.js";
+import { formatAgentPrompt, parseContextBudget, runCli } from "./cli.js";
 import { createConversationStore } from "./conversations.js";
 import { createJournal, type Journal } from "./journal.js";
 
@@ -732,4 +732,43 @@ describe("runCli", () => {
 		expect(prompt.close).toHaveBeenCalledOnce();
 		expect(finish).not.toHaveBeenCalled();
 	});
+});
+
+describe("context budget", () => {
+	it("leaves an absent budget unset", () => {
+		expect(parseContextBudget(undefined)).toBeUndefined();
+	});
+
+	it("parses a positive safe integer", () => {
+		expect(parseContextBudget("100000")).toBe(100_000);
+	});
+
+	it.each(["", "0", "-1", "1.5", "abc", "9007199254740992"])(
+		"rejects an invalid budget: %s",
+		(value) => {
+			expect(() => parseContextBudget(value)).toThrow(
+				"MICRO_AGENT_CONTEXT_BUDGET must be a positive safe integer",
+			);
+		},
+	);
+
+	it.each([
+		{ tokens: undefined, budget: undefined, expected: "agent> " },
+		{ tokens: undefined, budget: 100_000, expected: "agent> " },
+		{
+			tokens: 42_103,
+			budget: undefined,
+			expected: "agent [context 42,103]> ",
+		},
+		{
+			tokens: 42_103,
+			budget: 100_000,
+			expected: "agent [context 42,103/100,000 · 42%]> ",
+		},
+	])(
+		"formats exact context state: $expected",
+		({ tokens, budget, expected }) => {
+			expect(formatAgentPrompt(tokens, budget)).toBe(expected);
+		},
+	);
 });

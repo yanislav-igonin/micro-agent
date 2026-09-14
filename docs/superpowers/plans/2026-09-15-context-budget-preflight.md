@@ -36,7 +36,7 @@
 - Produces: `formatAgentPrompt(inputTokens: number | undefined, budget: number | undefined): string`.
 - `runCli()` receives one parsed optional budget as its final injectable argument.
 
-- [ ] **Step 1: Add failing parser and formatter tests**
+- [x] **Step 1: Add failing parser and formatter tests**
 
 Import both helpers in `src/cli.test.ts` and add:
 
@@ -74,11 +74,11 @@ describe("context budget", () => {
 });
 ```
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run `pnpm test src/cli.test.ts`. Expected: missing helper exports fail.
 
-- [ ] **Step 3: Implement parser and prompt formatter**
+- [x] **Step 3: Implement parser and prompt formatter**
 
 Add to `src/cli.ts`:
 
@@ -114,11 +114,11 @@ contextBudget = parseContextBudget(process.env.MICRO_AGENT_CONTEXT_BUDGET),
 
 Initialize `let latestInputTokens: number | undefined;`, pass both values to `formatAgentPrompt()` at `rl.question()`, and reset the count after successful `/new` or `/history` switching.
 
-- [ ] **Step 4: Run focused tests and verify GREEN**
+- [x] **Step 4: Run focused tests and verify GREEN**
 
 Run `pnpm test src/cli.test.ts && pnpm exec tsc --noEmit`.
 
-- [ ] **Step 5: Commit prompt configuration**
+- [x] **Step 5: Commit prompt configuration**
 
 ```bash
 git add src/cli.ts src/cli.test.ts docs/superpowers/plans/2026-09-15-context-budget-preflight.md
