@@ -100,6 +100,9 @@ describe("createAgent", () => {
 		expect(seenRequest).toMatchObject({
 			instructions: expect.stringContaining("historical project state"),
 		});
+		expect(seenRequest).toMatchObject({
+			instructions: expect.stringContaining("Prefer exact replace"),
+		});
 		expect(result).toEqual({
 			answer: "new answer",
 			input: expectedInput,

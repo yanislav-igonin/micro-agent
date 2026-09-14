@@ -795,7 +795,7 @@ git commit -m "feat(tools): add ranged file reads"
 - Produces: `replace({ path: string, oldText: string, newText: string })`.
 - Mutation contract: validation and match-count failures leave the file unchanged; a successful call writes the complete replacement once and returns `OK`.
 
-- [ ] **Step 1: Add failing replacement tests**
+- [x] **Step 1: Add failing replacement tests**
 
 Add to `src/tools.test.ts`:
 
@@ -868,7 +868,7 @@ describe("replace", () => {
 });
 ```
 
-- [ ] **Step 2: Run replacement tests and verify red state**
+- [x] **Step 2: Run replacement tests and verify red state**
 
 Run:
 
@@ -878,7 +878,7 @@ pnpm test src/tools.test.ts
 
 Expected: failures report `Unknown tool: replace` and the schema lookup returns `undefined`.
 
-- [ ] **Step 3: Implement exact replacement**
+- [x] **Step 3: Implement exact replacement**
 
 Add beside the existing file tools in `src/tools.ts`:
 
@@ -913,7 +913,7 @@ async function replace(args: {
 
 Searching for the second occurrence from `firstMatch + 1` intentionally detects overlapping matches such as `aa` inside `aaa`.
 
-- [ ] **Step 4: Add strict schema and dispatch validation**
+- [x] **Step 4: Add strict schema and dispatch validation**
 
 Add one tool definition next to `write` and `edit`:
 
@@ -968,7 +968,7 @@ case "replace": {
 }
 ```
 
-- [ ] **Step 5: Teach the model the safe edit rule**
+- [x] **Step 5: Teach the model the safe edit rule**
 
 Extend `SYSTEM_PROMPT` in `src/agent.ts` after the capability list:
 
@@ -986,7 +986,7 @@ expect(seenRequest).toMatchObject({
 });
 ```
 
-- [ ] **Step 6: Run focused tests and verify green state**
+- [x] **Step 6: Run focused tests and verify green state**
 
 Run:
 
@@ -996,7 +996,7 @@ pnpm test src/tools.test.ts src/agent.test.ts
 
 Expected: exact replacement, overlapping-match rejection, schema, instructions, range, and routing tests all pass.
 
-- [ ] **Step 7: Commit exact replacement**
+- [x] **Step 7: Commit exact replacement**
 
 ```bash
 git add src/tools.ts src/tools.test.ts src/agent.ts src/agent.test.ts

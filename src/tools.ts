@@ -223,6 +223,33 @@ async function edit(args: { path: string; content: string }) {
 	return exactOutput("OK");
 }
 
+async function replace(args: {
+	path: string;
+	oldText: string;
+	newText: string;
+}) {
+	if (args.oldText.length === 0) {
+		throw new Error("Tool argument oldText must not be empty");
+	}
+
+	const fullPath = resolveInsideRoot(args.path);
+	const content = await fs.readFile(fullPath, "utf8");
+	const firstMatch = content.indexOf(args.oldText);
+	if (firstMatch === -1) {
+		throw new Error("Exact replacement target not found");
+	}
+	if (content.indexOf(args.oldText, firstMatch + 1) !== -1) {
+		throw new Error("Exact replacement target has multiple matches");
+	}
+
+	const nextContent =
+		content.slice(0, firstMatch) +
+		args.newText +
+		content.slice(firstMatch + args.oldText.length);
+	await fs.writeFile(fullPath, nextContent, "utf8");
+	return exactOutput("OK");
+}
+
 async function run(args: { command: string }) {
 	const { stdout, stderr } = await execAsync(args.command, {
 		cwd: ROOT,
@@ -309,6 +336,33 @@ export const tools = [
 
 	{
 		type: "function" as const,
+		name: "replace",
+		description:
+			"Replace exactly one literal text match in a file without changing unread content",
+		parameters: {
+			type: "object",
+			properties: {
+				path: {
+					type: "string",
+					description: "Path relative to project root",
+				},
+				oldText: {
+					type: "string",
+					description: "Exact literal text that must occur once",
+				},
+				newText: {
+					type: "string",
+					description: "Replacement text",
+				},
+			},
+			required: ["path", "oldText", "newText"],
+			additionalProperties: false,
+		},
+		strict: true,
+	},
+
+	{
+		type: "function" as const,
 		name: "run",
 		description: "Execute a shell command",
 		parameters: {
@@ -378,6 +432,23 @@ export async function executeTool(
 				const fileArgs = { path: args.path, content: args.content };
 				prepared =
 					name === "write" ? await write(fileArgs) : await edit(fileArgs);
+				break;
+			}
+			case "replace": {
+				if (!("path" in args) || typeof args.path !== "string") {
+					throw new Error("Tool argument path must be a string");
+				}
+				if (!("oldText" in args) || typeof args.oldText !== "string") {
+					throw new Error("Tool argument oldText must be a string");
+				}
+				if (!("newText" in args) || typeof args.newText !== "string") {
+					throw new Error("Tool argument newText must be a string");
+				}
+				prepared = await replace({
+					path: args.path,
+					oldText: args.oldText,
+					newText: args.newText,
+				});
 				break;
 			}
 			case "run": {

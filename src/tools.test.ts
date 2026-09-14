@@ -178,3 +178,68 @@ describe("read", () => {
 		});
 	});
 });
+
+describe("replace", () => {
+	it("replaces one exact match", async () => {
+		const path = await projectFile("before target after");
+
+		const result = await executeTool("replace", {
+			path,
+			oldText: "target",
+			newText: "replacement",
+		});
+
+		expect(result).toMatchObject({
+			status: "ok",
+			output: "OK",
+			modelOutput: "OK",
+		});
+		expect(await fs.readFile(path, "utf8")).toBe("before replacement after");
+	});
+
+	it.each([
+		{ content: "unchanged", oldText: "missing", message: "not found" },
+		{ content: "same same", oldText: "same", message: "multiple matches" },
+		{ content: "aaa", oldText: "aa", message: "multiple matches" },
+		{ content: "unchanged", oldText: "", message: "must not be empty" },
+	])(
+		"rejects an unsafe target: $message",
+		async ({ content, oldText, message }) => {
+			const path = await projectFile(content);
+
+			const result = await executeTool("replace", {
+				path,
+				oldText,
+				newText: "changed",
+			});
+
+			expect(result.status).toBe("error");
+			expect(result.output).toContain(message);
+			expect(await fs.readFile(path, "utf8")).toBe(content);
+		},
+	);
+
+	it("keeps project-root protection", async () => {
+		const result = await executeTool("replace", {
+			path: "../outside.txt",
+			oldText: "old",
+			newText: "new",
+		});
+
+		expect(result.status).toBe("error");
+		expect(result.output).toContain("Path is outside project root");
+	});
+
+	it("publishes one strict replace schema", () => {
+		const replaceTool = tools.find((tool) => tool.name === "replace");
+
+		expect(replaceTool).toMatchObject({
+			type: "function",
+			strict: true,
+			parameters: {
+				required: ["path", "oldText", "newText"],
+				additionalProperties: false,
+			},
+		});
+	});
+});
