@@ -735,10 +735,21 @@ Also change the tool description to `Read a bounded range of a text file in the 
 
 - [ ] **Step 6: Update the existing restored-input expectation**
 
-The existing `src/agent.test.ts` test `discards failed working input before the next user request` compares the old raw README content. Replace that expected output with a value captured from the actual read result header and bounded content. Prefer checking the exact `function_call_output` returned by `executeTool("read", { path: "README.md" })`:
+The existing `src/agent.test.ts` test `discards failed working input before the next user request` compares the old raw README content. Give it a controlled file fixture so the expected ranged result is derived by hand rather than by calling the code under test:
 
 ```ts
-const expectedRead = await executeTool("read", { path: "README.md" });
+const artifact = `.checkpoint-read-${process.pid}.txt`;
+artifacts.push(artifact);
+await fs.writeFile(artifact, "known");
+const call = {
+  type: "function_call" as const,
+  name: "read",
+  arguments: JSON.stringify({ path: artifact }),
+  call_id: "call-1",
+};
+const expectedReadOutput =
+  `[read path=${JSON.stringify(artifact)} from=1:1 through=1:5 ` +
+  `total_lines=1 truncated=false next=none out_of_range=false]\nknown`;
 
 expect(seenInputs[1]).toEqual([
   ...restoredInput,
@@ -747,12 +758,12 @@ expect(seenInputs[1]).toEqual([
   {
     type: "function_call_output",
     call_id: "call-1",
-    output: expectedRead.modelOutput,
+    output: expectedReadOutput,
   },
 ]);
 ```
 
-Import `executeTool` from `./tools.js` in that test file. This keeps the assertion aligned with the public tool contract while the dedicated tool tests verify the exact header.
+Keep the literal independent from `prepareReadOutput`; dedicated tool tests cover the same header for other fixtures.
 
 - [ ] **Step 7: Run focused tests and verify green state**
 
