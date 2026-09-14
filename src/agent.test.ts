@@ -127,12 +127,18 @@ describe("createAgent", () => {
 
 	it("discards failed working input before the next user request", async () => {
 		const restoredInput = [{ role: "user" as const, content: "stable" }];
+		const artifact = `.checkpoint-read-${process.pid}.txt`;
+		artifacts.push(artifact);
+		await fs.writeFile(artifact, "known");
 		const call = {
 			type: "function_call" as const,
 			name: "read",
-			arguments: JSON.stringify({ path: "README.md" }),
+			arguments: JSON.stringify({ path: artifact }),
 			call_id: "call-1",
 		};
+		const expectedReadOutput =
+			`[read path=${JSON.stringify(artifact)} from=1:1 through=1:5 ` +
+			`total_lines=1 truncated=false next=none out_of_range=false]\nknown`;
 		const finalAnswer = assistantMessage("message-final", "recovered");
 		const seenInputs: unknown[] = [];
 		openai.create.mockImplementation(async (request) => {
@@ -169,7 +175,7 @@ describe("createAgent", () => {
 			{
 				type: "function_call_output",
 				call_id: "call-1",
-				output: await fs.readFile("README.md", "utf8"),
+				output: expectedReadOutput,
 			},
 		]);
 		expect(seenInputs[2]).toEqual([

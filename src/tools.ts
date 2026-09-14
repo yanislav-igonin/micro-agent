@@ -9,6 +9,13 @@ const execAsync = promisify(exec);
 const ROOT = process.cwd();
 const MODEL_OUTPUT_CHARACTERS = 20_000;
 const MODEL_OUTPUT_EDGE_CHARACTERS = 10_000;
+const READ_LINES = 200;
+const READ_CHARACTERS = 20_000;
+
+interface ReadPosition {
+	line: number;
+	column: number;
+}
 
 export interface ToolOutputTruncation {
 	strategy: "none" | "head_tail" | "range";
@@ -65,6 +72,123 @@ export function prepareBoundedOutput(output: string): PreparedToolOutput {
 	};
 }
 
+function readCoordinate(args: object, name: "startLine" | "startColumn") {
+	const value = (args as Record<string, unknown>)[name];
+	if (value === undefined) return 1;
+	if (!Number.isInteger(value) || (value as number) < 1) {
+		throw new Error(`Tool argument ${name} must be a positive integer`);
+	}
+	return value as number;
+}
+
+function formatPosition(position: ReadPosition | undefined) {
+	return position ? `${position.line}:${position.column}` : "none";
+}
+
+function prepareReadOutput(
+	path: string,
+	text: string,
+	startLine: number,
+	startColumn: number,
+): PreparedToolOutput {
+	const characters = Array.from(text);
+	const lineStarts: number[] = [];
+	if (characters.length > 0) lineStarts.push(0);
+	for (let index = 0; index < characters.length; index++) {
+		if (characters[index] === "\n" && index + 1 < characters.length) {
+			lineStarts.push(index + 1);
+		}
+	}
+	const totalLines = lineStarts.length;
+
+	let outOfRange = false;
+	let startOffset = characters.length;
+	if (startLine <= totalLines) {
+		const lineStart = lineStarts[startLine - 1] ?? characters.length;
+		const nextLineStart = lineStarts[startLine] ?? characters.length;
+		const contentEnd =
+			characters[nextLineStart - 1] === "\n"
+				? nextLineStart - 1
+				: nextLineStart;
+		const maximumColumn = contentEnd - lineStart + 1;
+		if (startColumn <= maximumColumn) {
+			startOffset = lineStart + startColumn - 1;
+		} else {
+			outOfRange = true;
+		}
+	} else if (!(startLine === totalLines + 1 && startColumn === 1)) {
+		outOfRange = true;
+	}
+
+	const positionAt = (offset: number): ReadPosition | undefined => {
+		if (offset < 0 || offset >= characters.length) return undefined;
+		let lineIndex = 0;
+		while (
+			lineIndex + 1 < lineStarts.length &&
+			(lineStarts[lineIndex + 1] ?? characters.length) <= offset
+		) {
+			lineIndex++;
+		}
+		return {
+			line: lineIndex + 1,
+			column: offset - (lineStarts[lineIndex] ?? 0) + 1,
+		};
+	};
+
+	if (outOfRange) {
+		const header =
+			`[read path=${JSON.stringify(path)} from=${startLine}:${startColumn} ` +
+			`through=none total_lines=${totalLines} truncated=false next=none ` +
+			`out_of_range=true]`;
+		return {
+			output: "",
+			modelOutput: header,
+			truncation: {
+				strategy: "range",
+				truncated: false,
+				originalCharacters: 0,
+				shownCharacters: 0,
+				omittedCharacters: 0,
+			},
+		};
+	}
+
+	const lastAllowedLine = Math.min(totalLines, startLine + READ_LINES - 1);
+	const lineLimit =
+		lastAllowedLine < totalLines
+			? (lineStarts[lastAllowedLine] ?? characters.length)
+			: characters.length;
+	const endOffset = Math.min(
+		startOffset + READ_CHARACTERS,
+		lineLimit,
+		characters.length,
+	);
+	const output = characters.slice(startOffset).join("");
+	const page = characters.slice(startOffset, endOffset).join("");
+	const truncated = endOffset < characters.length;
+	const through =
+		endOffset > startOffset ? positionAt(endOffset - 1) : undefined;
+	const next = truncated ? positionAt(endOffset) : undefined;
+	const shownCharacters = endOffset - startOffset;
+	const originalCharacters = characters.length - startOffset;
+	const header =
+		`[read path=${JSON.stringify(path)} from=${startLine}:${startColumn} ` +
+		`through=${formatPosition(through)} total_lines=${totalLines} ` +
+		`truncated=${truncated} next=${formatPosition(next)} out_of_range=false]`;
+
+	return {
+		output,
+		modelOutput: page ? `${header}\n${page}` : header,
+		truncation: {
+			strategy: "range",
+			truncated,
+			originalCharacters,
+			shownCharacters,
+			omittedCharacters: originalCharacters - shownCharacters,
+		},
+	};
+}
+
 function resolveInsideRoot(relativePath: string) {
 	const fullPath = path.resolve(ROOT, relativePath);
 
@@ -75,10 +199,14 @@ function resolveInsideRoot(relativePath: string) {
 	return fullPath;
 }
 
-async function read(args: { path: string }) {
+async function read(args: {
+	path: string;
+	startLine: number;
+	startColumn: number;
+}) {
 	const fullPath = resolveInsideRoot(args.path);
-
-	return prepareBoundedOutput(await fs.readFile(fullPath, "utf8"));
+	const text = await fs.readFile(fullPath, "utf8");
+	return prepareReadOutput(args.path, text, args.startLine, args.startColumn);
 }
 
 async function write(args: { path: string; content: string }) {
@@ -108,13 +236,25 @@ export const tools = [
 	{
 		type: "function" as const,
 		name: "read",
-		description: "Read the contents of a text file in the current project",
+		description:
+			"Read a bounded range of a text file in the current project; follow next coordinates when truncated",
 		parameters: {
 			type: "object",
 			properties: {
 				path: {
 					type: "string",
 					description: "Path relative to project root",
+				},
+				startLine: {
+					type: "integer",
+					minimum: 1,
+					description: "One-based line to start reading; defaults to 1",
+				},
+				startColumn: {
+					type: "integer",
+					minimum: 1,
+					description:
+						"One-based Unicode code-point column within startLine; defaults to 1",
 				},
 			},
 			required: ["path"],
@@ -220,7 +360,11 @@ export async function executeTool(
 				if (!("path" in args) || typeof args.path !== "string") {
 					throw new Error("Tool argument path must be a string");
 				}
-				prepared = await read({ path: args.path });
+				prepared = await read({
+					path: args.path,
+					startLine: readCoordinate(args, "startLine"),
+					startColumn: readCoordinate(args, "startColumn"),
+				});
 				break;
 			}
 			case "write":

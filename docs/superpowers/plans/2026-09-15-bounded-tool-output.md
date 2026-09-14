@@ -397,7 +397,7 @@ git commit -m "feat(tools): bound model-visible output"
 - Produces: `read({ path, startLine?, startColumn? })` with one-based coordinates and an exact continuation header.
 - Coordinate contract: newline belongs to the preceding line at `lineLength + 1`; a file ending in newline has no extra empty logical line.
 
-- [ ] **Step 1: Add failing read-range tests**
+- [x] **Step 1: Add failing read-range tests**
 
 Replace the existing tools import in `src/tools.test.ts` and add a file helper:
 
@@ -518,7 +518,7 @@ describe("read", () => {
 });
 ```
 
-- [ ] **Step 2: Assert the read schema exposes optional coordinates**
+- [x] **Step 2: Assert the read schema exposes optional coordinates**
 
 Add this schema check to `src/tools.test.ts` using the combined `tools` import from Step 1:
 
@@ -537,7 +537,7 @@ it("publishes strict optional read coordinates", () => {
 });
 ```
 
-- [ ] **Step 3: Run read tests and verify the red state**
+- [x] **Step 3: Run read tests and verify the red state**
 
 Run:
 
@@ -547,7 +547,7 @@ pnpm test src/tools.test.ts
 
 Expected: range headers and continuation tests fail; current `read` ignores coordinates and uses generic head/tail output.
 
-- [ ] **Step 4: Implement line/column paging in `src/tools.ts`**
+- [x] **Step 4: Implement line/column paging in `src/tools.ts`**
 
 Add constants and coordinate helpers:
 
@@ -713,7 +713,7 @@ case "read": {
 }
 ```
 
-- [ ] **Step 5: Extend the strict tool schema**
+- [x] **Step 5: Extend the strict tool schema**
 
 Add these optional properties under the existing `read.parameters.properties` object:
 
@@ -733,7 +733,7 @@ startColumn: {
 
 Also change the tool description to `Read a bounded range of a text file in the current project; follow next coordinates when truncated`. Keep `required: ["path"]`, `strict: true`, and `additionalProperties: false`.
 
-- [ ] **Step 6: Update the existing restored-input expectation**
+- [x] **Step 6: Update the existing restored-input expectation**
 
 The existing `src/agent.test.ts` test `discards failed working input before the next user request` compares the old raw README content. Give it a controlled file fixture so the expected ranged result is derived by hand rather than by calling the code under test:
 
@@ -765,7 +765,7 @@ expect(seenInputs[1]).toEqual([
 
 Keep the literal independent from `prepareReadOutput`; dedicated tool tests cover the same header for other fixtures.
 
-- [ ] **Step 7: Run focused tests and verify green state**
+- [x] **Step 7: Run focused tests and verify green state**
 
 Run:
 
@@ -775,7 +775,7 @@ pnpm test src/tools.test.ts src/agent.test.ts
 
 Expected: all range, long-line, schema, agent-loop, and existing checkpoint tests pass.
 
-- [ ] **Step 8: Commit deterministic reads**
+- [x] **Step 8: Commit deterministic reads**
 
 ```bash
 git add src/tools.ts src/tools.test.ts src/agent.test.ts
