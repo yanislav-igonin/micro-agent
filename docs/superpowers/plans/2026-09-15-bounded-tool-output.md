@@ -1076,7 +1076,7 @@ git add README.md
 git commit -m "docs: explain bounded tool output"
 ```
 
-- [ ] **Step 5: Re-run post-commit verification**
+- [x] **Step 5: Re-run post-commit verification**
 
 Run:
 
@@ -1089,7 +1089,7 @@ git status --short --branch
 
 Expected: all tests pass, typecheck and lint exit 0, and the branch has no uncommitted changes.
 
-- [ ] **Step 6: Update Linear only after verification**
+- [x] **Step 6: Update Linear only after verification**
 
 Use Linear MCP, not the browser:
 
