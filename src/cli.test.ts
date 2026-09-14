@@ -11,6 +11,12 @@ import { createConversationStore } from "./conversations.js";
 import { createJournal, type Journal } from "./journal.js";
 
 const roots: string[] = [];
+const clack = vi.hoisted(() => ({
+	select: vi.fn(),
+	isCancel: vi.fn((value: unknown) => typeof value === "symbol"),
+}));
+
+vi.mock("@clack/prompts", () => clack);
 
 function journalWith(
 	record: (...args: unknown[]) => unknown = vi.fn(),
@@ -25,6 +31,8 @@ function journalWith(
 function promptWith(answers: string[]) {
 	return Object.assign(new EventEmitter(), {
 		question: vi.fn(async () => answers.shift() ?? "quit"),
+		pause: vi.fn(),
+		resume: vi.fn(),
 		close: vi.fn(),
 	});
 }
@@ -48,6 +56,8 @@ function successfulAgentFactory(initialInput: ResponseInput = []) {
 }
 
 beforeEach(() => {
+	clack.select.mockReset();
+	clack.isCancel.mockClear();
 	vi.spyOn(console, "log").mockImplementation(() => {});
 	vi.spyOn(console, "error").mockImplementation(() => {});
 });
@@ -62,6 +72,347 @@ afterEach(async () => {
 });
 
 describe("runCli", () => {
+	it("cancels history without replacing the active conversation", async () => {
+		const { store } = await createStore();
+		await store.commitCheckpoint(
+			await store.startRequest(store.createConversation(), "saved request"),
+			[{ role: "user", content: "saved request" }],
+			"test-model",
+		);
+		clack.select.mockResolvedValue(Symbol("cancel"));
+		const createAgent = vi.fn(successfulAgentFactory);
+
+		await runCli(
+			promptWith(["current request", "/history", "continued request", "quit"]),
+			journalWith(),
+			store,
+			createAgent,
+			new EventEmitter(),
+		);
+
+		expect(createAgent).toHaveBeenCalledOnce();
+		const { conversations } = await store.listConversations();
+		expect(conversations).toHaveLength(2);
+		expect(conversations).toContainEqual(
+			expect.objectContaining({
+				input: [
+					{ role: "user", content: "current request" },
+					{ role: "user", content: "continued request" },
+				],
+			}),
+		);
+	});
+
+	it("shows an empty state and the count of invalid conversation files", async () => {
+		const { root, store } = await createStore();
+		await fs.writeFile(
+			path.join(root, "conversations", "aaaaaaaaaaaa.json"),
+			"{",
+		);
+
+		await runCli(
+			promptWith(["/history", "quit"]),
+			journalWith(),
+			store,
+			undefined,
+			new EventEmitter(),
+		);
+
+		expect(clack.select).not.toHaveBeenCalled();
+		expect(console.error).toHaveBeenCalledWith(
+			"WARNING: skipped 1 invalid conversation file(s).",
+		);
+		expect(console.log).toHaveBeenCalledWith("No saved conversations.");
+	});
+
+	it("blocks history and new while the completed checkpoint is unsaved", async () => {
+		const { store } = await createStore();
+		const failingStore = {
+			...store,
+			commitCheckpoint: vi.fn().mockRejectedValue(new Error("disk full")),
+		};
+		const createAgent = vi.fn(successfulAgentFactory);
+		const selectConversation = vi.fn();
+
+		await runCli(
+			promptWith(["first request", "/history", "/new", "quit"]),
+			journalWith(),
+			failingStore,
+			createAgent,
+			new EventEmitter(),
+			selectConversation,
+		);
+
+		expect(selectConversation).not.toHaveBeenCalled();
+		expect(createAgent).toHaveBeenCalledOnce();
+		expect(failingStore.commitCheckpoint).toHaveBeenCalledTimes(3);
+	});
+
+	it("supports switching conversations more than once in one run", async () => {
+		const { store } = await createStore();
+		const firstInput = [{ role: "user" as const, content: "first saved" }];
+		const secondInput = [{ role: "user" as const, content: "second saved" }];
+		const first = await store.commitCheckpoint(
+			await store.startRequest(store.createConversation(), "first saved"),
+			firstInput,
+			"test-model",
+		);
+		const second = await store.commitCheckpoint(
+			await store.startRequest(store.createConversation(), "second saved"),
+			secondInput,
+			"test-model",
+		);
+		const selections = [first.id, second.id];
+		const createAgent = vi.fn(successfulAgentFactory);
+
+		await runCli(
+			promptWith(["/history", "/history", "continued", "quit"]),
+			journalWith(),
+			store,
+			createAgent,
+			new EventEmitter(),
+			async () => selections.shift(),
+		);
+
+		expect(createAgent.mock.calls.map(([input]) => input)).toEqual([
+			[],
+			firstInput,
+			secondInput,
+		]);
+		expect((await store.loadConversation(second.id)).input).toEqual([
+			...secondInput,
+			{ role: "user", content: "continued" },
+		]);
+	});
+
+	it("uses the interactive selector when no test selector is injected", async () => {
+		const { store } = await createStore();
+		const savedInput = [{ role: "user" as const, content: "saved request" }];
+		const saved = await store.commitCheckpoint(
+			await store.startRequest(store.createConversation(), "saved request"),
+			savedInput,
+			"test-model",
+		);
+		clack.select.mockResolvedValue(saved.id);
+		const createAgent = vi.fn(successfulAgentFactory);
+
+		await runCli(
+			promptWith(["/history", "continued request", "quit"]),
+			journalWith(),
+			store,
+			createAgent,
+			new EventEmitter(),
+		);
+
+		expect(createAgent.mock.calls.map(([input]) => input)).toEqual([
+			[],
+			savedInput,
+		]);
+		expect(clack.select).toHaveBeenCalledWith({
+			message: "Select a conversation",
+			options: [
+				{
+					value: saved.id,
+					label: expect.stringContaining(saved.id),
+				},
+			],
+		});
+	});
+
+	it("shows recovery warnings and resumes only the stable checkpoint", async () => {
+		const { store } = await createStore();
+		const stableInput = [{ role: "user" as const, content: "stable request" }];
+		const completed = await store.commitCheckpoint(
+			await store.startRequest(store.createConversation(), "stable request"),
+			stableInput,
+			"old-model",
+		);
+		const pending = await store.markToolFinished(
+			await store.markToolStarted(
+				await store.markToolStarted(
+					await store.startRequest(completed, "unfinished request"),
+					{ callId: "call-started", name: "write" },
+				),
+				{ callId: "call-finished", name: "read" },
+			),
+			"call-finished",
+		);
+		const createAgent = vi.fn(successfulAgentFactory);
+
+		await runCli(
+			promptWith(["/history", "fresh request", "quit"]),
+			journalWith(),
+			store,
+			createAgent,
+			new EventEmitter(),
+			async () => pending.id,
+			"current-model",
+		);
+
+		expect(createAgent.mock.calls.map(([input]) => input)).toEqual([
+			[],
+			stableInput,
+		]);
+		expect(console.error).toHaveBeenCalledWith(
+			expect.stringContaining("unfinished request"),
+		);
+		expect(console.error).toHaveBeenCalledWith(
+			expect.stringContaining("write (call-started): started"),
+		);
+		expect(console.error).toHaveBeenCalledWith(
+			expect.stringContaining("read (call-finished): finished"),
+		);
+		expect(console.error).toHaveBeenCalledWith(
+			"WARNING: conversation last used old-model; current model is current-model.",
+		);
+		expect((await store.loadConversation(pending.id)).input).toEqual([
+			...stableInput,
+			{ role: "user", content: "fresh request" },
+		]);
+	});
+
+	it("keeps the active conversation when the selected file changes before loading", async () => {
+		const { root, store } = await createStore();
+		const target = await store.commitCheckpoint(
+			await store.startRequest(store.createConversation(), "target request"),
+			[{ role: "user", content: "target request" }],
+			"old-model",
+		);
+		const createAgent = vi.fn(successfulAgentFactory);
+		const selectConversation = vi.fn(async () => {
+			await fs.writeFile(
+				path.join(root, "conversations", `${target.id}.json`),
+				"{",
+			);
+			return target.id;
+		});
+
+		await runCli(
+			promptWith(["current request", "/history", "continued request", "quit"]),
+			journalWith(),
+			store,
+			createAgent,
+			new EventEmitter(),
+			selectConversation,
+		);
+
+		expect(createAgent).toHaveBeenCalledOnce();
+		const { conversations } = await store.listConversations();
+		expect(conversations).toHaveLength(1);
+		expect(conversations.at(0)?.input).toEqual([
+			{ role: "user", content: "current request" },
+			{ role: "user", content: "continued request" },
+		]);
+		expect(console.error).toHaveBeenCalledWith(
+			"WARNING: selected conversation could not be loaded; current conversation is unchanged.",
+		);
+	});
+
+	it("keeps the active conversation when the selected file changes to another valid state", async () => {
+		const { store } = await createStore();
+		let target = await store.commitCheckpoint(
+			await store.startRequest(store.createConversation(), "target request"),
+			[{ role: "user", content: "target request" }],
+			"old-model",
+		);
+		const createAgent = vi.fn(successfulAgentFactory);
+		const selectConversation = vi.fn(async () => {
+			target = await store.startRequest(target, "changed after listing");
+			return target.id;
+		});
+
+		await runCli(
+			promptWith(["current request", "/history", "continued request", "quit"]),
+			journalWith(),
+			store,
+			createAgent,
+			new EventEmitter(),
+			selectConversation,
+		);
+
+		expect(createAgent).toHaveBeenCalledOnce();
+		const { conversations } = await store.listConversations();
+		expect(conversations).toContainEqual(
+			expect.objectContaining({
+				input: [
+					{ role: "user", content: "current request" },
+					{ role: "user", content: "continued request" },
+				],
+			}),
+		);
+		expect(console.error).toHaveBeenCalledWith(
+			"WARNING: selected conversation could not be loaded; current conversation is unchanged.",
+		);
+	});
+
+	it("loads the selected checkpoint and continues it with a recreated agent", async () => {
+		const { store } = await createStore();
+		const savedInput = [{ role: "user" as const, content: "saved request" }];
+		const saved = await store.commitCheckpoint(
+			await store.startRequest(store.createConversation(), "saved request"),
+			savedInput,
+			"old-model",
+		);
+		const prompt = promptWith(["/history", "continued request", "quit"]);
+		const createAgent = vi.fn(successfulAgentFactory);
+		const seenChoices: unknown[] = [];
+		const selectConversation = vi.fn(async (choices: unknown) => {
+			seenChoices.push(choices);
+			return saved.id;
+		});
+
+		await runCli(
+			prompt,
+			journalWith(),
+			store,
+			createAgent,
+			new EventEmitter(),
+			selectConversation,
+		);
+
+		expect(prompt.pause).toHaveBeenCalledOnce();
+		expect(prompt.resume).toHaveBeenCalledOnce();
+		expect(seenChoices).toEqual([
+			[
+				{
+					value: saved.id,
+					label: expect.stringContaining(`${saved.id}  saved request`),
+				},
+			],
+		]);
+		expect(createAgent.mock.calls.map(([input]) => input)).toEqual([
+			[],
+			savedInput,
+		]);
+		expect((await store.loadConversation(saved.id)).input).toEqual([
+			...savedInput,
+			{ role: "user", content: "continued request" },
+		]);
+	});
+
+	it("starts a new empty conversation without deleting the previous checkpoint", async () => {
+		const { store } = await createStore();
+		const createAgent = vi.fn(successfulAgentFactory);
+
+		await runCli(
+			promptWith(["first request", "/new", "second request", "quit"]),
+			journalWith(),
+			store,
+			createAgent,
+			new EventEmitter(),
+		);
+
+		expect(createAgent.mock.calls.map(([input]) => input)).toEqual([[], []]);
+		const { conversations } = await store.listConversations();
+		expect(conversations.map(({ input }) => input)).toEqual(
+			expect.arrayContaining([
+				[{ role: "user", content: "first request" }],
+				[{ role: "user", content: "second request" }],
+			]),
+		);
+		expect(conversations).toHaveLength(2);
+	});
+
 	it("persists pending and tool status before committing exact agent input", async () => {
 		const { store } = await createStore();
 		const agent = vi.fn(
@@ -271,6 +622,8 @@ describe("runCli", () => {
 		const finish = vi.fn();
 		const prompt = Object.assign(new EventEmitter(), {
 			question: vi.fn(() => new Promise<string>(() => {})),
+			pause: vi.fn(),
+			resume: vi.fn(),
 			close: vi.fn(),
 		});
 
@@ -367,6 +720,8 @@ describe("runCli", () => {
 		const finish = vi.fn();
 		const prompt = Object.assign(new EventEmitter(), {
 			question: vi.fn().mockRejectedValue(failure),
+			pause: vi.fn(),
+			resume: vi.fn(),
 			close: vi.fn(),
 		});
 

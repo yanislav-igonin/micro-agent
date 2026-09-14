@@ -1,12 +1,42 @@
+import { isCancel, select } from "@clack/prompts";
 import { type AgentResult, createAgent } from "./agent.js";
-import type { ConversationStore } from "./conversations.js";
+import type { ConversationState, ConversationStore } from "./conversations.js";
 import type { Journal } from "./journal.js";
 
 interface CliPrompt {
 	question(query: string): Promise<string>;
+	pause(): void;
+	resume(): void;
 	close(): void;
 	once(event: "SIGINT", listener: () => void): this;
 	off(event: "SIGINT", listener: () => void): this;
+}
+
+export interface ConversationChoice {
+	value: string;
+	label: string;
+}
+
+export type ConversationSelector = (
+	choices: ConversationChoice[],
+) => Promise<string | undefined>;
+
+export async function selectSavedConversation(choices: ConversationChoice[]) {
+	const selected = await select({
+		message: "Select a conversation",
+		options: choices,
+	});
+	if (isCancel(selected)) return undefined;
+	return typeof selected === "string" ? selected : undefined;
+}
+
+function conversationChoice(
+	conversation: ConversationState,
+): ConversationChoice {
+	return {
+		value: conversation.id,
+		label: `${new Date(conversation.updatedAt).toLocaleString()}  ${conversation.id}  ${conversation.title}`,
+	};
 }
 
 interface SignalSource {
@@ -20,12 +50,14 @@ export async function runCli(
 	conversationStore: ConversationStore,
 	createAgentForInput = createAgent,
 	signals: SignalSource = process,
+	selectConversation: ConversationSelector = selectSavedConversation,
+	currentModel = process.env.OPENAI_MODEL ?? "gpt-5.6-luna",
 ) {
 	let requestNumber = 0;
 	let stopping = false;
 	let activeRequest: AbortController | undefined;
 	let conversation = conversationStore.createConversation();
-	const agent = createAgentForInput(conversation.input);
+	let agent = createAgentForInput(conversation.input);
 	let unsaved: AgentResult | undefined;
 	let interrupt: () => void = () => {};
 	const interrupted = new Promise<true>((resolve) => {
@@ -70,6 +102,78 @@ export async function runCli(
 					);
 					continue;
 				}
+			}
+
+			if (prompt === "/new") {
+				conversation = conversationStore.createConversation();
+				agent = createAgentForInput(conversation.input);
+				continue;
+			}
+
+			if (prompt === "/history") {
+				const { conversations, invalidFileCount } =
+					await conversationStore.listConversations();
+				if (invalidFileCount > 0) {
+					console.error(
+						`WARNING: skipped ${invalidFileCount} invalid conversation file(s).`,
+					);
+				}
+				if (conversations.length === 0) {
+					console.log("No saved conversations.");
+					continue;
+				}
+
+				rl.pause();
+				let selectedId: string | undefined;
+				try {
+					selectedId = await selectConversation(
+						conversations.map(conversationChoice),
+					);
+				} finally {
+					rl.resume();
+				}
+				if (!selectedId) continue;
+
+				try {
+					const listedConversation = conversations.find(
+						(candidate) => candidate.id === selectedId,
+					);
+					const loadedConversation =
+						await conversationStore.loadConversation(selectedId);
+					if (
+						!listedConversation ||
+						JSON.stringify(loadedConversation) !==
+							JSON.stringify(listedConversation)
+					) {
+						throw new Error("Conversation changed after listing");
+					}
+					const loadedAgent = createAgentForInput(loadedConversation.input);
+					conversation = loadedConversation;
+					agent = loadedAgent;
+					if (loadedConversation.pendingRequest) {
+						console.error(
+							`WARNING: incomplete request was not resumed: ${loadedConversation.pendingRequest.prompt}`,
+						);
+						for (const tool of loadedConversation.pendingRequest.tools) {
+							console.error(
+								`WARNING: tool ${tool.name} (${tool.callId}): ${tool.status}.`,
+							);
+						}
+					}
+					if (
+						loadedConversation.lastModel &&
+						loadedConversation.lastModel !== currentModel
+					) {
+						console.error(
+							`WARNING: conversation last used ${loadedConversation.lastModel}; current model is ${currentModel}.`,
+						);
+					}
+				} catch {
+					console.error(
+						"WARNING: selected conversation could not be loaded; current conversation is unchanged.",
+					);
+				}
+				continue;
 			}
 
 			const controller = new AbortController();

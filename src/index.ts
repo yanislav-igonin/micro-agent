@@ -17,7 +17,7 @@ const rl = createInterface({
 });
 
 console.log("Micro Agent");
-console.log('Type "exit" or press Ctrl-C to quit.\n');
+console.log('Type "/history", "/new", "exit", or press Ctrl-C.\n');
 
 const result = await runCli(rl, journal, conversationStore);
 if (result.interrupted) {

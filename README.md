@@ -5,7 +5,9 @@ A small TypeScript CLI coding agent using the OpenAI Responses API.
 Use `pnpm@12.3.4`. Install with `pnpm install`, copy `.env.example` to `.env`,
 set `OPENAI_API_KEY`, then run `pnpm dev`. `OPENAI_MODEL` overrides the default
 model. Type `exit` or `quit` to finish. Each CLI launch keeps one conversation, so
-follow-up prompts can refer to earlier messages and tool results from that launch.
+follow-up prompts can refer to earlier messages and tool results. Type `/history` to
+select a saved project-local conversation, or `/new` to start an empty conversation
+without deleting the current one.
 
 ## Work journal
 
@@ -73,6 +75,37 @@ advanced input in memory, and blocks later requests until the same checkpoint sa
 Conversation files are local, sensitive, unencrypted, ignored by Git, and use the
 same `0700` directory and `0600` file permissions as journals.
 
+`/history` lists valid checkpoints newest-first. Each row contains the local update
+time, the 12-character conversation ID, and the stable title derived from its first
+request. Use the arrow keys and Enter to load a checkpoint, or Escape to keep the
+current conversation. `/new` and `/history` can be used repeatedly during one run.
+Neither command can switch away from a completed checkpoint that is still `UNSAVED`.
+
+Loading always rereads and validates the selected file. A corrupt, unreadable, or
+changed file is skipped without replacing the active conversation; the CLI reports
+only the skipped-file count. A restored incomplete request is displayed with its
+known tool statuses, but is never replayed. `started` means a tool may have produced
+side effects; `finished` means its execution returned before interruption. The next
+ordinary prompt deliberately abandons that pending request and continues from the
+last complete checkpoint.
+
+Restored conversations use the current `OPENAI_MODEL`, system instructions, tools,
+and project files. A model mismatch produces a warning. Earlier tool outputs describe
+historical project state, so the agent must reread relevant files before changing
+them. Conversation JSON can contain prompts, model output, file contents, commands,
+and tool results. Keep the project directory and backups protected; there is no
+encryption, automatic cleanup, retention policy, or concurrent-use protection.
+
+Manual recovery check:
+
+1. Complete a request, start another request, and interrupt it after a tool starts.
+2. Restart the CLI in the same project and run `/history`.
+3. Select the conversation and confirm the incomplete prompt and tool statuses appear.
+4. Press Escape once to confirm cancellation preserves the active conversation, then
+   reopen `/history` and select the checkpoint.
+5. Send a new prompt and confirm no pending work runs automatically, the saved
+   conversation moves to the top, and the project files are reread when relevant.
+
 Inspect a journal with standard JSON tools, for example:
 
 ```sh
@@ -88,6 +121,10 @@ then try a missing file or failing shell command, send a second prompt, and quit
 Check JSON parsing, sequence order, matching call IDs, separate request numbers,
 `OK` for writes, error outputs, and the final `cli_finished` event. Check file
 permissions and `--no-log` as well.
+
+Also verify `/history` with arrow keys, Enter, and Escape; its empty and corrupt-file
+states; repeated switching; `/new`; normal exit; newest-first reordering; incomplete
+request recovery; a model mismatch; and a project file changed after the checkpoint.
 
 For deterministic malformed arguments, model failures and the 20-step limit,
 point the SDK's `OPENAI_BASE_URL` at a local HTTP fixture serving Responses payloads
