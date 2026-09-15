@@ -9,6 +9,21 @@ follow-up prompts can refer to earlier messages and tool results. Type `/history
 select a saved project-local conversation, or `/new` to start an empty conversation
 without deleting the current one.
 
+`MICRO_AGENT_CONTEXT_BUDGET` optionally sets a positive integer limit for model
+input tokens. Invalid values stop startup. The normal prompt shows `agent> ` before
+the first exact measurement, `agent [context 42,103]> ` without a budget, or
+`agent [context 42,103/100,000 · 42%]> ` with one. These counts come only from
+Responses API usage or exact input-token preflight; local bounds never appear in
+the prompt. With no budget, the agent shows raw usage without a percentage or limit.
+
+With a budget, a conservative local size check triggers exact preflight when input
+could reach 80% of the limit. The agent warns once per period at or above 80%, then
+resets that warning after exact usage falls below 80%. An exact preflight count above
+100% blocks the model call and leaves the last complete conversation checkpoint
+unchanged. A required preflight failure also stops the model call. The CLI suggests
+`/new`, raising `MICRO_AGENT_CONTEXT_BUDGET`, or future compaction after a hard
+block. Automatic truncation and compaction are disabled.
+
 ## Work journal
 
 Each CLI launch creates one `logs/<UTC-timestamp>-<pid>.jsonl` file and prints its

@@ -139,7 +139,7 @@ git commit -m "feat(cli): add context budget prompt"
 - Extends `AgentRunOptions` with `onContextMeasured?: (inputTokens: number) => void`.
 - `response.usage.input_tokens` is the only source for post-response measurements.
 
-- [ ] **Step 1: Add failing agent usage tests**
+- [x] **Step 1: Add failing agent usage tests**
 
 Add an `onContextMeasured` spy to a one-response agent test. Return a response fixture containing `usage: { input_tokens: 321 }` and assert:
 
@@ -150,15 +150,15 @@ expect(onContextMeasured).toHaveBeenCalledWith(321);
 
 Add a second fixture without `usage` and assert the callback is not called, preserving compatibility with existing minimal mocks.
 
-- [ ] **Step 2: Add a failing CLI prompt progression test**
+- [x] **Step 2: Add a failing CLI prompt progression test**
 
 Use a custom agent that calls `options.onContextMeasured?.(42_103)` during the first request. Assert the prompt mock received `"agent> "` first and `"agent [context 42,103]> "` next. Repeat with a `100_000` final budget argument and expect `42%`.
 
-- [ ] **Step 3: Run focused tests and verify RED**
+- [x] **Step 3: Run focused tests and verify RED**
 
 Run `pnpm test src/agent.test.ts src/cli.test.ts`. Expected: the callback is absent and prompts stay `agent> `.
 
-- [ ] **Step 4: Publish response usage and wire the CLI**
+- [x] **Step 4: Publish response usage and wire the CLI**
 
 In `src/agent.ts`, add the callback to `AgentRunOptions`. Immediately after a successful response and before processing its output:
 
@@ -176,16 +176,14 @@ onContextMeasured: (inputTokens) => {
 },
 ```
 
-- [ ] **Step 5: Run focused tests and verify GREEN**
+- [x] **Step 5: Run focused tests and verify GREEN**
 
 Run `pnpm test src/agent.test.ts src/cli.test.ts && pnpm exec tsc --noEmit`.
 
-- [ ] **Step 6: Commit exact response usage**
+- [x] **Step 6: Commit exact response usage**
 
-```bash
-git add src/agent.ts src/agent.test.ts src/cli.ts src/cli.test.ts docs/superpowers/plans/2026-09-15-context-budget-preflight.md
-git commit -m "feat(agent): report exact input usage"
-```
+Included with preflight enforcement in commit `5142f16` so measurement state and
+CLI wiring form one coherent functional change.
 
 ---
 
@@ -202,7 +200,7 @@ git commit -m "feat(agent): report exact input usage"
 - Produces exported `ContextBudgetExceededError` for the CLI's actionable error message.
 - Calls `openai.responses.inputTokens.count(request, { signal })` only when the conservative gate reaches 80% or prior measurement cannot safely apply.
 
-- [ ] **Step 1: Extend the OpenAI mock and add failing preflight tests**
+- [x] **Step 1: Extend the OpenAI mock and add failing preflight tests**
 
 Add hoisted `count: vi.fn()`, expose it as `responses.inputTokens.count`, and reset it before each test. Cover these independent cases:
 
@@ -218,19 +216,19 @@ Add hoisted `count: vi.fn()`, expose it as `responses.inputTokens.count`, and re
 
 Inspect arguments rather than reusing production estimators. Assert no request contains `truncation: "auto"`.
 
-- [ ] **Step 2: Add failing hard-block and failure tests**
+- [x] **Step 2: Add failing hard-block and failure tests**
 
 With budget `100`, make count return `101`; assert `responses.create` is not called, the run rejects with `ContextBudgetExceededError`, the exact `101` is published, and the agent's stable checkpoint is used by the next request. Make count reject in another test; assert create is not called and Journal `model_error` data has `phase: "input_token_count"`.
 
-- [ ] **Step 3: Add failing warning-period tests**
+- [x] **Step 3: Add failing warning-period tests**
 
 Return exact counts `80`, `90`, `79`, `80` under budget `100`. Assert warning callback counts are `[80, 80]`: one warning in the first continuous high period, reset below 80, then one new warning.
 
-- [ ] **Step 4: Run agent tests and verify RED**
+- [x] **Step 4: Run agent tests and verify RED**
 
 Run `pnpm test src/agent.test.ts`. Expected: no input-token call, enforcement, warning state, or specialized error exists.
 
-- [ ] **Step 5: Implement the conservative gate and exact state**
+- [x] **Step 5: Implement the conservative gate and exact state**
 
 Inside `createAgent`, retain:
 
@@ -241,11 +239,11 @@ let exactMeasurement:
 let highUsageWarningShown = false;
 ```
 
-Use `Buffer.byteLength(JSON.stringify(request), "utf8")` as a conservative upper bound. Tokens cannot exceed bytes; it is only a preflight gate. Preflight when there is no prior exact measurement and full request bytes reach `budget * 0.8`; with a prior same-model measurement and nonshrinking request, preflight when `inputTokens + byteGrowth` reaches that boundary; otherwise preflight because uncertainty cannot be bounded safely.
+Use `Buffer.byteLength(JSON.stringify(request), "utf8")` as a conservative full-request bound. It is only a preflight gate. Preflight when that bound reaches `budget * 0.8`. With a prior exact measurement, also compare its count plus byte growth and preflight on model changes or shrinking requests. Never rely on byte growth alone: appending content can change tokenization at the boundary.
 
 Centralize exact-state publication in one local function that replaces the old measurement, calls `onContextMeasured`, warns once at or above 80%, and resets warning state below 80%.
 
-- [ ] **Step 6: Call exact preflight before create and block over budget**
+- [x] **Step 6: Call exact preflight before create and block over budget**
 
 Journal the assembled `model_request` first. Initialize the SDK client, run required count with the complete request and abort signal, publish the exact count, then:
 
@@ -257,7 +255,7 @@ if (count.input_tokens > contextBudget) {
 
 Only then call `responses.create()`. Tag count failures in existing `model_error` data with `phase: "input_token_count"`; never fall through. After a successful response, replace exact state from `response.usage.input_tokens` and the byte size of that request.
 
-- [ ] **Step 7: Wire warnings and actionable hard-limit output in CLI**
+- [x] **Step 7: Wire warnings and actionable hard-limit output in CLI**
 
 Pass `contextBudget`, the measurement callback, and:
 
@@ -269,16 +267,13 @@ onContextWarning: (inputTokens, budget) => {
 
 In the request catch, print `ContextBudgetExceededError.message`, which instructs `/new`, increasing `MICRO_AGENT_CONTEXT_BUDGET`, or waiting for compaction; retain the existing generic failure message for all other errors.
 
-- [ ] **Step 8: Run focused tests and verify GREEN**
+- [x] **Step 8: Run focused tests and verify GREEN**
 
 Run `pnpm test src/agent.test.ts src/cli.test.ts && pnpm exec tsc --noEmit`.
 
-- [ ] **Step 9: Commit exact preflight enforcement**
+- [x] **Step 9: Commit exact preflight enforcement**
 
-```bash
-git add src/agent.ts src/agent.test.ts src/cli.ts src/cli.test.ts docs/superpowers/plans/2026-09-15-context-budget-preflight.md
-git commit -m "feat(agent): enforce context budget"
-```
+Committed in `5142f16` (`feat(agent): enforce context budget`).
 
 ---
 
@@ -288,11 +283,11 @@ git commit -m "feat(agent): enforce context budget"
 - Modify: `README.md`
 - Verify: `src/agent.ts`, `src/agent.test.ts`, `src/cli.ts`, `src/cli.test.ts`
 
-- [ ] **Step 1: Document configuration and exact semantics**
+- [x] **Step 1: Document configuration and exact semantics**
 
 Document `MICRO_AGENT_CONTEXT_BUDGET`, all three prompt forms, 80% exact preflight/warning behavior, the strict `>100%` block, and that no-budget mode displays response usage without imposing a limit. State that estimates are never displayed and automatic truncation/compaction remain disabled.
 
-- [ ] **Step 2: Run complete verification**
+- [x] **Step 2: Run complete verification**
 
 Run separately and require exit code 0:
 
@@ -303,11 +298,11 @@ pnpm lint
 git diff --check
 ```
 
-- [ ] **Step 3: Audit the scoped diff**
+- [x] **Step 3: Audit the scoped diff**
 
 Verify no new dependency/module, no `truncation: "auto"`, no compaction, complete preflight request equality, stable checkpoint after failures, and exact-only display/enforcement.
 
-- [ ] **Step 4: Commit documentation**
+- [x] **Step 4: Commit documentation**
 
 ```bash
 git add README.md docs/superpowers/plans/2026-09-15-context-budget-preflight.md
