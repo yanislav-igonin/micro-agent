@@ -6,6 +6,7 @@ export type StopReason =
 	| "final_answer"
 	| "max_steps"
 	| "model_error"
+	| "compaction_error"
 	| "unexpected_error"
 	| "cancelled";
 
@@ -15,6 +16,9 @@ export type JournalEvent =
 	| "model_request"
 	| "model_response"
 	| "model_error"
+	| "compaction_started"
+	| "compaction_finished"
+	| "compaction_failed"
 	| "tool_started"
 	| "tool_finished"
 	| "user_request_finished"

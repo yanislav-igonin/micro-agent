@@ -6,11 +6,16 @@ import type { Journal } from "./journal.js";
 const openai = vi.hoisted(() => ({
 	create: vi.fn(),
 	count: vi.fn(),
+	compact: vi.fn(),
 }));
 
 vi.mock("openai", () => ({
 	default: class {
-		responses = { create: openai.create, inputTokens: { count: openai.count } };
+		responses = {
+			create: openai.create,
+			compact: openai.compact,
+			inputTokens: { count: openai.count },
+		};
 	},
 }));
 
@@ -53,6 +58,7 @@ function journalWith(
 beforeEach(() => {
 	openai.create.mockReset();
 	openai.count.mockReset();
+	openai.compact.mockReset();
 });
 
 afterEach(async () => {
@@ -63,6 +69,293 @@ afterEach(async () => {
 });
 
 describe("createAgent", () => {
+	it("never compacts without a configured context budget", async () => {
+		openai.create.mockResolvedValue({
+			output: [assistantMessage("no-budget", "done")],
+			output_text: "done",
+			usage: { input_tokens: 90_000 },
+		});
+		await createAgent()("goal", journalWith(), 1, {
+			onCompacted: async () => {},
+		});
+		expect(openai.count).not.toHaveBeenCalled();
+		expect(openai.compact).not.toHaveBeenCalled();
+		expect(openai.create).toHaveBeenCalledOnce();
+	});
+	it("compacts complete input after exact 80% preflight and saves before model work", async () => {
+		const compacted = [
+			{ type: "compaction", id: "cmp-1", encrypted_content: "opaque" },
+		];
+		const sequence: string[] = [];
+		openai.count.mockResolvedValue({ input_tokens: 80 });
+		openai.compact.mockImplementation(async () => {
+			sequence.push("compact");
+			return {
+				id: "resp-1",
+				object: "response.compaction",
+				output: compacted,
+				usage: { input_tokens: 80 },
+			};
+		});
+		openai.create.mockImplementation(async (request) => {
+			sequence.push("create");
+			expect(request.input).toEqual(compacted);
+			return {
+				output: [assistantMessage("after", "done")],
+				output_text: "done",
+			};
+		});
+		const onCompacted = vi.fn(async () => {
+			sequence.push("save");
+		});
+		await createAgent([{ role: "user", content: "old goal PRI-296" }])(
+			"continue",
+			journalWith(),
+			1,
+			{
+				contextBudget: 100,
+				onCompacted,
+			},
+		);
+		expect(sequence).toEqual(["compact", "save", "create"]);
+		expect(openai.compact.mock.calls[0]?.[0]).toMatchObject({
+			model: expect.any(String),
+			instructions: expect.any(String),
+			tools: expect.any(Array),
+			input: [
+				{ role: "user", content: "old goal PRI-296" },
+				{ role: "user", content: "continue" },
+			],
+		});
+		expect(onCompacted).toHaveBeenCalledWith(compacted, expect.any(String));
+	});
+
+	it("keeps the stable input on compact API failure and makes no model call", async () => {
+		openai.count.mockResolvedValue({ input_tokens: 80 });
+		openai.compact.mockRejectedValueOnce(new Error("compact failed"));
+		const agent = createAgent([{ role: "user", content: "stable" }]);
+		const records: Array<{ type: string; data: unknown; context: unknown }> =
+			[];
+		await expect(
+			agent("first", journalWith(records), 1, {
+				contextBudget: 100,
+				onCompacted: async () => {},
+			}),
+		).rejects.toThrow("compact failed");
+		expect(openai.create).not.toHaveBeenCalled();
+		expect(
+			records.find(({ type }) => type === "compaction_failed")?.data,
+		).toMatchObject({
+			phase: "compact_api",
+			error: { message: "compact failed" },
+		});
+		expect(
+			records.find(({ type }) => type === "user_request_finished")?.data,
+		).toMatchObject({ reason: "compaction_error" });
+		expect(records.some(({ type }) => type === "model_error")).toBe(false);
+		openai.compact.mockResolvedValue({
+			id: "resp-2",
+			object: "response.compaction",
+			output: [
+				{ type: "compaction", id: "cmp-2", encrypted_content: "opaque" },
+			],
+			usage: { input_tokens: 80 },
+		});
+		openai.create.mockResolvedValue({
+			output: [assistantMessage("after", "done")],
+			output_text: "done",
+		});
+		await agent("fresh", journalWith(), 2, {
+			contextBudget: 100,
+			onCompacted: async () => {},
+		});
+		expect(openai.compact.mock.calls[1]?.[0].input).toEqual([
+			{ role: "user", content: "stable" },
+			{ role: "user", content: "fresh" },
+		]);
+	});
+
+	it("rejects a malformed compact result before checkpoint mutation", async () => {
+		openai.count.mockResolvedValue({ input_tokens: 80 });
+		openai.compact.mockResolvedValue({
+			id: "resp-bad",
+			object: "response.compaction",
+			output: [{ type: "compaction", id: "cmp-bad", encrypted_content: "" }],
+		});
+		const onCompacted = vi.fn();
+		await expect(
+			createAgent()("goal", journalWith(), 1, {
+				contextBudget: 100,
+				onCompacted,
+			}),
+		).rejects.toThrow("Invalid compact response");
+		expect(onCompacted).not.toHaveBeenCalled();
+		expect(openai.create).not.toHaveBeenCalled();
+	});
+
+	it("rejects truthy but non-string compaction fields before checkpoint save", async () => {
+		openai.count.mockResolvedValue({ input_tokens: 80 });
+		openai.compact.mockResolvedValue({
+			id: 42,
+			object: "response.compaction",
+			output: [
+				{
+					type: "compaction",
+					id: { bad: true },
+					encrypted_content: { bad: true },
+				},
+			],
+		});
+		const onCompacted = vi.fn();
+		await expect(
+			createAgent()("goal", journalWith(), 1, {
+				contextBudget: 100,
+				onCompacted,
+			}),
+		).rejects.toThrow("Invalid compact response");
+		expect(onCompacted).not.toHaveBeenCalled();
+		expect(openai.create).not.toHaveBeenCalled();
+	});
+
+	it("retains the exact compact result when checkpoint save fails", async () => {
+		const compacted = [
+			{ type: "compaction", id: "cmp-save", encrypted_content: "opaque-save" },
+		];
+		openai.count.mockResolvedValue({ input_tokens: 80 });
+		openai.compact.mockResolvedValue({
+			id: "resp-save",
+			object: "response.compaction",
+			output: compacted,
+			usage: { input_tokens: 80 },
+		});
+		const onCompacted = vi.fn().mockRejectedValue(new Error("disk full"));
+		const records: Array<{ type: string; data: unknown; context: unknown }> =
+			[];
+		await expect(
+			createAgent()("goal", journalWith(records), 1, {
+				contextBudget: 100,
+				onCompacted,
+			}),
+		).rejects.toMatchObject({
+			name: "UnsavedCompactionError",
+			input: compacted,
+		});
+		expect(openai.compact).toHaveBeenCalledOnce();
+		expect(openai.create).not.toHaveBeenCalled();
+		expect(
+			records.find(({ type }) => type === "compaction_failed")?.data,
+		).toMatchObject({
+			phase: "checkpoint_save",
+			response: { id: "resp-save" },
+			error: { message: "disk full" },
+		});
+	});
+
+	it("compacts mid-request only after every emitted tool call has an output", async () => {
+		const records: Array<{ type: string; data: unknown; context: unknown }> =
+			[];
+		openai.create
+			.mockResolvedValueOnce({
+				output: [
+					{
+						type: "function_call",
+						name: "read",
+						arguments: "{",
+						call_id: "uncertain-call",
+					},
+				],
+				output_text: "",
+				usage: { input_tokens: 79_999 },
+			})
+			.mockResolvedValueOnce({
+				output: [assistantMessage("final", "continue done")],
+				output_text: "continue done",
+			});
+		openai.count
+			.mockResolvedValueOnce({ input_tokens: 80_000 })
+			.mockResolvedValueOnce({ input_tokens: 1_000 });
+		const compacted = [
+			{ type: "compaction", id: "cmp-mid", encrypted_content: "opaque" },
+		];
+		openai.compact.mockResolvedValue({
+			id: "resp-mid",
+			object: "response.compaction",
+			output: compacted,
+			usage: { input_tokens: 80_000 },
+		});
+		const onCompacted = vi.fn(async () => {});
+		await createAgent()(
+			"Goal: fix PRI-296. Decision: keep existing files. Plan: verify src/agent.ts. Failure: typecheck failed. Side effect of uncertain-call unknown.",
+			journalWith(records),
+			1,
+			{ contextBudget: 100_000, onCompacted },
+		);
+		expect(openai.create).toHaveBeenCalledTimes(2);
+		expect(openai.compact).toHaveBeenCalledOnce();
+		const compactRequest = openai.compact.mock.calls[0]?.[0];
+		expect(compactRequest.input).toContainEqual({
+			type: "function_call_output",
+			call_id: "uncertain-call",
+			output: expect.stringContaining("Invalid tool arguments"),
+		});
+		expect(compactRequest.input[0].content).toContain(
+			"Side effect of uncertain-call unknown",
+		);
+		expect(onCompacted).toHaveBeenCalledWith(compacted, expect.any(String));
+		expect(
+			records.find(({ type }) => type === "compaction_finished")?.data,
+		).toMatchObject({
+			beforeTokens: 80_000,
+			afterTokens: 1_000,
+			response: { id: "resp-mid" },
+		});
+	});
+
+	it("uses the compacted request size for later local preflight decisions", async () => {
+		openai.count
+			.mockResolvedValueOnce({ input_tokens: 80_000 })
+			.mockResolvedValueOnce({ input_tokens: 100 });
+		openai.compact.mockResolvedValue({
+			id: "resp-small",
+			object: "response.compaction",
+			output: [
+				{ type: "compaction", id: "cmp-small", encrypted_content: "opaque" },
+			],
+			usage: { input_tokens: 80_000 },
+		});
+		openai.create.mockResolvedValue({
+			output: [assistantMessage("small-answer", "done")],
+			output_text: "done",
+			usage: { input_tokens: 100 },
+		});
+		const agent = createAgent([{ role: "user", content: "x".repeat(90_000) }]);
+		await agent("first", journalWith(), 1, {
+			contextBudget: 100_000,
+			onCompacted: async () => {},
+		});
+		await agent("later", journalWith(), 2, {
+			contextBudget: 100_000,
+			onCompacted: async () => {},
+		});
+		expect(openai.count).toHaveBeenCalledTimes(2);
+		expect(openai.compact).toHaveBeenCalledOnce();
+	});
+
+	it("blocks the next step when a recorded tool is still started", async () => {
+		const onModelStepBoundary = vi
+			.fn()
+			.mockRejectedValue(new Error("Started tool blocks the next model step"));
+		await expect(
+			createAgent()("goal", journalWith(), 1, {
+				contextBudget: 100,
+				onModelStepBoundary,
+				onCompacted: async () => {},
+			}),
+		).rejects.toThrow("Started tool");
+		expect(openai.count).not.toHaveBeenCalled();
+		expect(openai.compact).not.toHaveBeenCalled();
+		expect(openai.create).not.toHaveBeenCalled();
+	});
 	it("skips preflight for a small request with a large budget", async () => {
 		openai.create.mockResolvedValue({
 			output: [assistantMessage("small", "done")],

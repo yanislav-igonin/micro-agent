@@ -69,7 +69,19 @@ function isResponseInputItem(value: unknown) {
 	if (!isRecord(value)) return false;
 	if (value.type === undefined || value.type === "message") {
 		if (value.role === "user") {
-			return typeof value.content === "string";
+			return (
+				typeof value.content === "string" ||
+				(value.type === "message" &&
+					typeof value.id === "string" &&
+					isItemStatus(value.status) &&
+					Array.isArray(value.content) &&
+					value.content.every(
+						(item) =>
+							isRecord(item) &&
+							item.type === "input_text" &&
+							typeof item.text === "string",
+					))
+			);
 		}
 		return (
 			value.type === "message" &&
@@ -82,6 +94,14 @@ function isResponseInputItem(value: unknown) {
 				value.phase === null ||
 				value.phase === "commentary" ||
 				value.phase === "final_answer")
+		);
+	}
+	if (value.type === "compaction") {
+		return (
+			typeof value.id === "string" &&
+			value.id.length > 0 &&
+			typeof value.encrypted_content === "string" &&
+			value.encrypted_content.length > 0
 		);
 	}
 	if (value.type === "reasoning") {
@@ -423,6 +443,24 @@ export async function createConversationStore(
 				input: structuredClone(input),
 				lastModel,
 				pendingRequest: null,
+			});
+		},
+		async saveCompactionCheckpoint(
+			conversation: ConversationState,
+			input: ResponseInput,
+			lastModel: string,
+		) {
+			if (!conversation.pendingRequest)
+				throw new Error("Conversation has no pending request");
+			if (
+				conversation.pendingRequest.tools.some(
+					(tool) => tool.status === "started",
+				)
+			)
+				throw new Error("Started tool blocks compaction");
+			return saveMutation(conversation, {
+				input: structuredClone(input),
+				lastModel,
 			});
 		},
 		async loadConversation(id: string) {

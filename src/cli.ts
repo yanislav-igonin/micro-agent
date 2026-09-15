@@ -1,8 +1,10 @@
 import { isCancel, select } from "@clack/prompts";
+import type { ResponseInput } from "openai/resources/responses/responses";
 import {
 	type AgentResult,
 	ContextBudgetExceededError,
 	createAgent,
+	UnsavedCompactionError,
 } from "./agent.js";
 import type { ConversationState, ConversationStore } from "./conversations.js";
 import type { Journal } from "./journal.js";
@@ -21,12 +23,15 @@ export function parseContextBudget(value: string | undefined) {
 export function formatAgentPrompt(
 	inputTokens: number | undefined,
 	budget: number | undefined,
+	compacted = false,
 ) {
-	if (inputTokens === undefined) return "agent> ";
+	if (inputTokens === undefined)
+		return compacted ? "agent [· compacted]> " : "agent> ";
 	const count = inputTokens.toLocaleString("en-US");
-	if (budget === undefined) return `agent [context ${count}]> `;
+	if (budget === undefined)
+		return `agent [context ${count}${compacted ? " · compacted" : ""}]> `;
 	const percentage = Math.round((inputTokens / budget) * 100);
-	return `agent [context ${count}/${budget.toLocaleString("en-US")} · ${percentage}%]> `;
+	return `agent [context ${count}/${budget.toLocaleString("en-US")} · ${percentage}%${compacted ? " · compacted" : ""}]> `;
 }
 
 interface CliPrompt {
@@ -85,7 +90,11 @@ export async function runCli(
 	let activeRequest: AbortController | undefined;
 	let conversation = conversationStore.createConversation();
 	let agent = createAgentForInput(conversation.input);
-	let unsaved: AgentResult | undefined;
+	let unsaved:
+		| { kind: "final"; result: AgentResult }
+		| { kind: "compaction"; input: ResponseInput; model: string }
+		| undefined;
+	let showCompacted = false;
 	let latestInputTokens: number | undefined;
 	let interrupt: () => void = () => {};
 	const interrupted = new Promise<true>((resolve) => {
@@ -101,9 +110,13 @@ export async function runCli(
 
 	const promptLoop = async () => {
 		while (!stopping) {
-			const prompt = (
-				await rl.question(formatAgentPrompt(latestInputTokens, contextBudget))
-			).trim();
+			const promptText = formatAgentPrompt(
+				latestInputTokens,
+				contextBudget,
+				showCompacted,
+			);
+			showCompacted = false;
+			const prompt = (await rl.question(promptText)).trim();
 
 			if (!prompt) {
 				continue;
@@ -120,12 +133,25 @@ export async function runCli(
 
 			if (unsaved) {
 				try {
-					conversation = await conversationStore.commitCheckpoint(
-						conversation,
-						unsaved.input,
-						unsaved.model,
-					);
+					conversation =
+						unsaved.kind === "compaction"
+							? await conversationStore.saveCompactionCheckpoint(
+									conversation,
+									unsaved.input,
+									unsaved.model,
+								)
+							: await conversationStore.commitCheckpoint(
+									conversation,
+									unsaved.result.input,
+									unsaved.result.model,
+								);
+					const wasCompaction = unsaved.kind === "compaction";
 					unsaved = undefined;
+					if (wasCompaction) {
+						agent = createAgentForInput(conversation.input);
+						showCompacted = true;
+						continue;
+					}
 				} catch {
 					console.error(
 						"UNSAVED: checkpoint persistence still fails; request was not started.",
@@ -209,6 +235,14 @@ export async function runCli(
 			}
 
 			const controller = new AbortController();
+			if (
+				conversation.pendingRequest?.tools.some(
+					(tool) => tool.status === "started",
+				)
+			) {
+				console.error("WARNING: a started tool blocks the next model call.");
+				continue;
+			}
 			activeRequest = controller;
 			requestNumber++;
 			try {
@@ -240,6 +274,22 @@ export async function runCli(
 							callId,
 						);
 					},
+					onModelStepBoundary: async () => {
+						if (
+							conversation.pendingRequest?.tools.some(
+								(tool) => tool.status === "started",
+							)
+						)
+							throw new Error("Started tool blocks the next model step");
+					},
+					onCompacted: async (input, model) => {
+						conversation = await conversationStore.saveCompactionCheckpoint(
+							conversation,
+							input,
+							model,
+						);
+						showCompacted = true;
+					},
 				});
 
 				console.log(`\n${result.answer}\n`);
@@ -250,18 +300,31 @@ export async function runCli(
 						result.model,
 					);
 				} catch {
-					unsaved = result;
+					unsaved = { kind: "final", result };
 					console.error(
 						"UNSAVED: final checkpoint persistence failed; later work is blocked.",
 					);
 				}
 			} catch (error) {
-				if (!stopping) {
+				if (error instanceof UnsavedCompactionError) {
+					unsaved = {
+						kind: "compaction",
+						input: structuredClone(error.input),
+						model: error.model,
+					};
 					console.error(
-						error instanceof ContextBudgetExceededError
-							? error.message
-							: "Request failed; checkpoint was not advanced. See the journal for details.",
+						"UNSAVED: compacted checkpoint persistence failed; only retrying the same save or exit is allowed.",
 					);
+				}
+				if (!stopping) {
+					if (!(error instanceof UnsavedCompactionError))
+						console.error(
+							error instanceof ContextBudgetExceededError
+								? error.message
+								: showCompacted
+									? "Request failed after the compacted checkpoint was saved; model and tool work stopped."
+									: "Request failed; checkpoint was not advanced. See the journal for details.",
+						);
 				}
 			} finally {
 				activeRequest = undefined;

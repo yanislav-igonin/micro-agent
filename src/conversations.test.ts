@@ -32,6 +32,64 @@ async function createStore() {
 }
 
 describe("createConversationStore", () => {
+	it("atomically replaces old input with a restorable compacted window and retains pending work", async () => {
+		const { root, store } = await createStore();
+		const old = [{ role: "user" as const, content: "old goal PRI-296" }];
+		const committed = await store.commitCheckpoint(
+			await store.startRequest(store.createConversation(), "old goal"),
+			old,
+			"test-model",
+		);
+		const pending = await store.startRequest(
+			committed,
+			"continue verification",
+		);
+		const compacted = [
+			{
+				id: "msg-kept",
+				type: "message" as const,
+				role: "user" as const,
+				status: "completed" as const,
+				content: [
+					{ type: "input_text" as const, text: "continue verification" },
+				],
+			},
+			{ type: "compaction" as const, id: "cmp-1", encrypted_content: "opaque" },
+		] as ResponseInput;
+		const saved = await store.saveCompactionCheckpoint(
+			pending,
+			compacted,
+			"test-model",
+		);
+		const restored = await store.loadConversation(saved.id);
+		expect(restored.input).toEqual(compacted);
+		expect(restored.pendingRequest?.prompt).toBe("continue verification");
+		expect(JSON.stringify(restored)).not.toContain("old goal PRI-296");
+		expect(
+			JSON.parse(
+				await fs.readFile(
+					path.join(root, "conversations", `${saved.id}.json`),
+					"utf8",
+				),
+			).input,
+		).toEqual(compacted);
+	});
+
+	it("refuses compact checkpoint saves while a tool is started", async () => {
+		const { store } = await createStore();
+		const started = await store.markToolStarted(
+			await store.startRequest(store.createConversation(), "goal"),
+			{ callId: "call-1", name: "write" },
+		);
+		await expect(
+			store.saveCompactionCheckpoint(
+				started,
+				[{ type: "compaction", id: "cmp", encrypted_content: "opaque" }],
+				"test-model",
+			),
+		).rejects.toThrow("Started tool");
+		expect((await store.loadConversation(started.id)).input).toEqual([]);
+	});
 	it("does not create a state file for an empty conversation", async () => {
 		const { root, store } = await createStore();
 

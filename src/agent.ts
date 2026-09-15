@@ -1,7 +1,9 @@
 import OpenAI from "openai";
 import type { InputTokenCountParams } from "openai/resources/responses/input-tokens";
 import type {
+	CompactedResponse,
 	Response,
+	ResponseCompactParams,
 	ResponseCreateParamsNonStreaming,
 	ResponseInput,
 } from "openai/resources/responses/responses";
@@ -18,10 +20,81 @@ let openai: OpenAI | undefined;
 export class ContextBudgetExceededError extends Error {
 	constructor(inputTokens: number, budget: number) {
 		super(
-			`Context Budget exceeded: ${inputTokens}/${budget} input tokens. Use /new, increase MICRO_AGENT_CONTEXT_BUDGET, or wait for future compaction.`,
+			`Context Budget exceeded: ${inputTokens}/${budget} input tokens. Use /new or increase MICRO_AGENT_CONTEXT_BUDGET.`,
 		);
 		this.name = "ContextBudgetExceededError";
 	}
+}
+
+export class UnsavedCompactionError extends Error {
+	constructor(
+		public readonly input: ResponseInput,
+		public readonly model: string,
+		cause: unknown,
+	) {
+		super("UNSAVED: compacted checkpoint persistence failed", { cause });
+		this.name = "UnsavedCompactionError";
+	}
+}
+
+function compactedInput(response: unknown): ResponseInput {
+	const data = response as CompactedResponse | undefined;
+	if (
+		data?.object !== "response.compaction" ||
+		typeof data.id !== "string" ||
+		data.id.length === 0 ||
+		!Array.isArray(data.output) ||
+		data.output.length === 0
+	) {
+		throw new Error("Invalid compact response");
+	}
+	const last = data.output.at(-1);
+	if (
+		last?.type !== "compaction" ||
+		typeof last.id !== "string" ||
+		last.id.length === 0 ||
+		typeof last.encrypted_content !== "string" ||
+		last.encrypted_content.length === 0 ||
+		data.output.filter((item) => item.type === "compaction").length !== 1
+	) {
+		throw new Error("Invalid compact response");
+	}
+	for (const candidate of data.output.slice(0, -1) as unknown[]) {
+		const item = candidate as Record<string, unknown>;
+		if (
+			item?.type !== "message" ||
+			item.role !== "user" ||
+			typeof item.id !== "string" ||
+			item.status !== "completed" ||
+			!Array.isArray(item.content) ||
+			!item.content.every(
+				(content: unknown) =>
+					typeof content === "object" &&
+					content !== null &&
+					"type" in content &&
+					content.type === "input_text" &&
+					"text" in content &&
+					typeof content.text === "string",
+			)
+		) {
+			throw new Error("Invalid compact response");
+		}
+	}
+	return structuredClone(data.output) as ResponseInput;
+}
+
+function hasUnansweredToolCall(input: ResponseInput) {
+	const calls = new Set<string>();
+	for (const item of input) {
+		if (item.type === "function_call" && typeof item.call_id === "string")
+			calls.add(item.call_id);
+		if (
+			item.type === "function_call_output" &&
+			typeof item.call_id === "string"
+		)
+			calls.delete(item.call_id);
+	}
+	return calls.size > 0;
 }
 
 const SYSTEM_PROMPT = `
@@ -55,6 +128,8 @@ export interface AgentRunOptions {
 	onContextWarning?: (inputTokens: number, budget: number) => void;
 	onToolStarted?: (tool: { callId: string; name: string }) => Promise<void>;
 	onToolFinished?: (callId: string) => Promise<void>;
+	onModelStepBoundary?: () => Promise<void>;
+	onCompacted?: (input: ResponseInput, model: string) => Promise<void>;
 }
 
 export interface AgentResult {
@@ -99,7 +174,17 @@ export function createAgent(restoredInput: ResponseInput = []) {
 			userPrompt,
 			journal,
 			requestNumber,
-			options,
+			{
+				...options,
+				...(options.onCompacted
+					? {
+							onCompacted: async (input: ResponseInput, model: string) => {
+								await options.onCompacted?.(input, model);
+								checkpointInput = structuredClone(input);
+							},
+						}
+					: {}),
+			},
 			() => exactMeasurement,
 			publishExactMeasurement,
 		);
@@ -140,6 +225,9 @@ async function runAgent(
 	try {
 		for (let stepNumber = 1; stepNumber <= 20; stepNumber++) {
 			options.signal?.throwIfAborted();
+			await options.onModelStepBoundary?.();
+			if (hasUnansweredToolCall(input))
+				throw new Error("Unanswered tool call blocks the next model step");
 			const contextualStep = { ...context, stepNumber };
 			console.log(`[request ${requestNumber} step ${stepNumber}] started`);
 			const model = process.env.OPENAI_MODEL ?? "gpt-5.6-luna";
@@ -148,12 +236,15 @@ async function runAgent(
 					model,
 					instructions: SYSTEM_PROMPT,
 					tools,
-					input,
+					input: structuredClone(input),
 				};
-			const requestBytes = Buffer.byteLength(JSON.stringify(request), "utf8");
-			await journal.record("model_request", request, contextualStep);
+			let requestBytes = Buffer.byteLength(JSON.stringify(request), "utf8");
 			let response: Response;
-			let errorPhase: "input_token_count" | "context_budget" | undefined;
+			let errorPhase:
+				| "input_token_count"
+				| "context_budget"
+				| "compaction"
+				| undefined;
 			try {
 				// Initialize after the journal so configuration failures are recorded too.
 				openai ??= new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -186,13 +277,104 @@ async function runAgent(
 							model,
 							options,
 						);
-						if (count.input_tokens > budget) {
+						if (count.input_tokens >= softBoundary && options.onCompacted) {
+							errorPhase = "compaction";
+							const diagnostics = {
+								trigger: "context_budget_80_percent",
+								beforeTokens: count.input_tokens,
+								beforeBytes: requestBytes,
+							};
+							await journal.record(
+								"compaction_started",
+								{ ...diagnostics, request: structuredClone(request) },
+								contextualStep,
+							);
+							let phase = "compact_api";
+							let compactResponse: CompactedResponse | undefined;
+							try {
+								const compactRequest = {
+									...request,
+								} as ResponseCompactParams & { tools: typeof tools };
+								compactResponse = await openai.responses.compact(
+									compactRequest,
+									{ signal: options.signal },
+								);
+								phase = "validation";
+								const nextInput = compactedInput(compactResponse);
+								phase = "checkpoint_save";
+								try {
+									await options.onCompacted(nextInput, model);
+								} catch (error) {
+									throw new UnsavedCompactionError(nextInput, model, error);
+								}
+								input.splice(0, input.length, ...nextInput);
+								request.input = structuredClone(input);
+								requestBytes = Buffer.byteLength(
+									JSON.stringify(request),
+									"utf8",
+								);
+								phase = "post_compaction_preflight";
+								const after = await openai.responses.inputTokens.count(
+									request,
+									{ signal: options.signal },
+								);
+								publishExactMeasurement(
+									after.input_tokens,
+									requestBytes,
+									model,
+									options,
+								);
+								await journal.record(
+									"compaction_finished",
+									{
+										...diagnostics,
+										afterTokens: after.input_tokens,
+										afterBytes: requestBytes,
+										response: compactResponse,
+									},
+									contextualStep,
+								);
+								if (after.input_tokens > budget)
+									throw new ContextBudgetExceededError(
+										after.input_tokens,
+										budget,
+									);
+							} catch (error) {
+								await journal.record(
+									"compaction_failed",
+									{
+										...diagnostics,
+										phase,
+										...(compactResponse
+											? {
+													response: compactResponse,
+													afterBytes: Buffer.byteLength(
+														JSON.stringify({
+															...request,
+															input: compactResponse.output,
+														}),
+														"utf8",
+													),
+												}
+											: {}),
+										error: normalizeError(
+											error instanceof UnsavedCompactionError
+												? error.cause
+												: error,
+										),
+									},
+									contextualStep,
+								);
+								throw error;
+							}
+						} else if (count.input_tokens > budget) {
 							errorPhase = "context_budget";
 							throw new ContextBudgetExceededError(count.input_tokens, budget);
 						}
 						errorPhase = undefined;
 					}
 				}
+				await journal.record("model_request", request, contextualStep);
 				response = await openai.responses.create(request, {
 					signal: options.signal,
 				});
@@ -201,15 +383,17 @@ async function runAgent(
 					reason = "cancelled";
 					throw error;
 				}
-				reason = "model_error";
-				await journal.record(
-					"model_error",
-					{
-						...normalizeError(error),
-						...(errorPhase ? { phase: errorPhase } : {}),
-					},
-					contextualStep,
-				);
+				reason =
+					errorPhase === "compaction" ? "compaction_error" : "model_error";
+				if (errorPhase !== "compaction")
+					await journal.record(
+						"model_error",
+						{
+							...normalizeError(error),
+							...(errorPhase ? { phase: errorPhase } : {}),
+						},
+						contextualStep,
+					);
 				throw error;
 			}
 			options.signal?.throwIfAborted();
