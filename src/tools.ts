@@ -74,7 +74,7 @@ export function prepareBoundedOutput(output: string): PreparedToolOutput {
 
 function readCoordinate(args: object, name: "startLine" | "startColumn") {
 	const value = (args as Record<string, unknown>)[name];
-	if (value === undefined) return 1;
+	if (value === undefined || value === null) return 1;
 	if (!Number.isInteger(value) || (value as number) < 1) {
 		throw new Error(`Tool argument ${name} must be a positive integer`);
 	}
@@ -273,18 +273,18 @@ export const tools = [
 					description: "Path relative to project root",
 				},
 				startLine: {
-					type: "integer",
+					type: ["integer", "null"],
 					minimum: 1,
-					description: "One-based line to start reading; defaults to 1",
+					description: "One-based line to start reading; null defaults to 1",
 				},
 				startColumn: {
-					type: "integer",
+					type: ["integer", "null"],
 					minimum: 1,
 					description:
-						"One-based Unicode code-point column within startLine; defaults to 1",
+						"One-based Unicode code-point column within startLine; null defaults to 1",
 				},
 			},
-			required: ["path"],
+			required: ["path", "startLine", "startColumn"],
 			additionalProperties: false,
 		},
 		strict: true,

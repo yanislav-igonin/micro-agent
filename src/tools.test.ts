@@ -169,14 +169,36 @@ describe("read", () => {
 		const readTool = tools.find((tool) => tool.name === "read");
 
 		expect(readTool?.parameters).toMatchObject({
-			required: ["path"],
+			required: ["path", "startLine", "startColumn"],
 			additionalProperties: false,
 			properties: {
-				startLine: { type: "integer", minimum: 1 },
-				startColumn: { type: "integer", minimum: 1 },
+				startLine: { type: ["integer", "null"], minimum: 1 },
+				startColumn: { type: ["integer", "null"], minimum: 1 },
 			},
 		});
 	});
+
+	it("treats nullable read coordinates as defaults", async () => {
+		const path = await projectFile("alpha\nbeta");
+
+		const result = await executeTool("read", {
+			path,
+			startLine: null,
+			startColumn: null,
+		});
+
+		expect(result.status).toBe("ok");
+		expect(result.modelOutput).toContain("from=1:1 through=2:4");
+	});
+});
+
+it("lists every strict tool property as required", () => {
+	for (const tool of tools) {
+		if (!tool.strict) continue;
+		expect(new Set(tool.parameters.required)).toEqual(
+			new Set(Object.keys(tool.parameters.properties)),
+		);
+	}
 });
 
 describe("replace", () => {

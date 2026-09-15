@@ -527,11 +527,11 @@ it("publishes strict optional read coordinates", () => {
   const readTool = tools.find((tool) => tool.name === "read");
 
   expect(readTool?.parameters).toMatchObject({
-    required: ["path"],
+    required: ["path", "startLine", "startColumn"],
     additionalProperties: false,
     properties: {
-      startLine: { type: "integer", minimum: 1 },
-      startColumn: { type: "integer", minimum: 1 },
+      startLine: { type: ["integer", "null"], minimum: 1 },
+      startColumn: { type: ["integer", "null"], minimum: 1 },
     },
   });
 });
@@ -565,7 +565,7 @@ function readCoordinate(
   name: "startLine" | "startColumn",
 ) {
   const value = name in args ? args[name] : undefined;
-  if (value === undefined) return 1;
+  if (value === undefined || value === null) return 1;
   if (!Number.isInteger(value) || (value as number) < 1) {
     throw new Error(`Tool argument ${name} must be a positive integer`);
   }
@@ -719,19 +719,19 @@ Add these optional properties under the existing `read.parameters.properties` ob
 
 ```ts
 startLine: {
-  type: "integer",
+  type: ["integer", "null"],
   minimum: 1,
-  description: "One-based line to start reading; defaults to 1",
+  description: "One-based line to start reading; null defaults to 1",
 },
 startColumn: {
-  type: "integer",
+  type: ["integer", "null"],
   minimum: 1,
   description:
-    "One-based Unicode code-point column within startLine; defaults to 1",
+    "One-based Unicode code-point column within startLine; null defaults to 1",
 },
 ```
 
-Also change the tool description to `Read a bounded range of a text file in the current project; follow next coordinates when truncated`. Keep `required: ["path"]`, `strict: true`, and `additionalProperties: false`.
+Also change the tool description to `Read a bounded range of a text file in the current project; follow next coordinates when truncated`. Strict function schemas require every property, so keep `required: ["path", "startLine", "startColumn"]`, make both coordinates nullable, and interpret `null` as the default `1`. Keep `strict: true` and `additionalProperties: false`.
 
 - [x] **Step 6: Update the existing restored-input expectation**
 
