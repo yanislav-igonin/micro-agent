@@ -36,6 +36,22 @@ _Avoid_: Prompt, standalone context
 One request to the model and its response within a user request. Tool calls emitted by that response and their results belong to the same model step.
 _Avoid_: Turn, iteration
 
+**Model Input**:
+The exact content assembled for one model step: current instructions, tool definitions, and the selected conversation items. Journal-only data is not part of it.
+_Avoid_: Prompt, conversation, journal
+
+**Model-visible Tool Output**:
+The bounded representation of one tool result appended to model input. It may omit data that remains available in the journal.
+_Avoid_: Raw tool result, journal output
+
+**Context Budget**:
+The configured maximum number of input tokens Micro Agent permits in one model input. It is an application safety boundary, not the model's context window.
+_Avoid_: Context window, model limit
+
+**Compaction**:
+The deliberate replacement of older model input with a smaller continuation-preserving representation. It does not alter the journal.
+_Avoid_: Tool-output truncation, summarization
+
 **Journal**:
 The detailed, best-effort diagnostic record of agent activity produced during one run. It is not used to restore conversation state.
 _Avoid_: Log, trace

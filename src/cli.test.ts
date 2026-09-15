@@ -6,7 +6,8 @@ import type { ResponseInput } from "openai/resources/responses/responses";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AgentRunOptions } from "./agent.js";
-import { runCli } from "./cli.js";
+import { ContextBudgetExceededError, UnsavedCompactionError } from "./agent.js";
+import { formatAgentPrompt, parseContextBudget, runCli } from "./cli.js";
 import { createConversationStore } from "./conversations.js";
 import { createJournal, type Journal } from "./journal.js";
 
@@ -30,7 +31,7 @@ function journalWith(
 
 function promptWith(answers: string[]) {
 	return Object.assign(new EventEmitter(), {
-		question: vi.fn(async () => answers.shift() ?? "quit"),
+		question: vi.fn(async (_query: string) => answers.shift() ?? "quit"),
 		pause: vi.fn(),
 		resume: vi.fn(),
 		close: vi.fn(),
@@ -72,6 +73,216 @@ afterEach(async () => {
 });
 
 describe("runCli", () => {
+	it("shows the compacted marker in exactly one prompt after a successful save", async () => {
+		const { store } = await createStore();
+		const prompt = promptWith(["first", "second", "quit"]);
+		const compacted: ResponseInput = [
+			{ type: "compaction", id: "cmp-marker", encrypted_content: "opaque" },
+		];
+		let runs = 0;
+		const agent = async (
+			userPrompt: string,
+			_journal: Journal,
+			_number: number,
+			options: AgentRunOptions = {},
+		) => {
+			runs++;
+			if (runs === 1) await options.onCompacted?.(compacted, "test-model");
+			return {
+				answer: "done",
+				input: [...compacted, { role: "user" as const, content: userPrompt }],
+				model: "test-model",
+			};
+		};
+		await runCli(prompt, journalWith(), store, () => agent, new EventEmitter());
+		expect(prompt.question.mock.calls.map(([label]) => label)).toEqual([
+			"agent> ",
+			"agent [· compacted]> ",
+			"agent> ",
+		]);
+	});
+	it("restores a compacted checkpoint for a later user request without resuming old work", async () => {
+		const { store } = await createStore();
+		const compacted: ResponseInput = [
+			{ type: "compaction", id: "cmp-old", encrypted_content: "opaque" },
+		];
+		const saved = await store.saveCompactionCheckpoint(
+			await store.startRequest(
+				store.createConversation(),
+				"unfinished old work",
+			),
+			compacted,
+			"test-model",
+		);
+		const createAgent = vi.fn(successfulAgentFactory);
+		await runCli(
+			promptWith(["/history", "later request", "quit"]),
+			journalWith(),
+			store,
+			createAgent,
+			new EventEmitter(),
+			async () => saved.id,
+		);
+		expect(createAgent.mock.calls.map(([input]) => input)).toEqual([
+			[],
+			compacted,
+		]);
+		expect((await store.loadConversation(saved.id)).input).toEqual([
+			...compacted,
+			{ role: "user", content: "later request" },
+		]);
+		expect(console.error).toHaveBeenCalledWith(
+			expect.stringContaining("incomplete request was not resumed"),
+		);
+	});
+	it("retries only the exact unsaved compact checkpoint and blocks switching", async () => {
+		const { store } = await createStore();
+		const compacted: ResponseInput = [
+			{ type: "compaction", id: "cmp-1", encrypted_content: "opaque" },
+		];
+		let saves = 0;
+		const flakyStore = {
+			...store,
+			saveCompactionCheckpoint: async (
+				...args: Parameters<typeof store.saveCompactionCheckpoint>
+			) => {
+				saves++;
+				if (saves < 3) throw new Error("disk full");
+				return store.saveCompactionCheckpoint(...args);
+			},
+		};
+		const agent = vi.fn(
+			async (
+				_prompt: string,
+				_journal: Journal,
+				_number: number,
+				options: AgentRunOptions = {},
+			) => {
+				try {
+					await options.onCompacted?.(compacted, "test-model");
+				} catch {
+					throw new UnsavedCompactionError(
+						compacted,
+						"test-model",
+						new Error("disk full"),
+					);
+				}
+				throw new Error("unexpected continuation");
+			},
+		);
+		const selector = vi.fn();
+		const prompt = promptWith(["first", "/new", "/history", "quit"]);
+		await runCli(
+			prompt,
+			journalWith(),
+			flakyStore,
+			() => agent,
+			new EventEmitter(),
+			selector,
+		);
+		expect(agent).toHaveBeenCalledOnce();
+		expect(selector).not.toHaveBeenCalled();
+		expect(saves).toBe(3);
+		const { conversations } = await store.listConversations();
+		expect(conversations).toHaveLength(1);
+		expect(conversations[0]?.input).toEqual(compacted);
+		expect(conversations[0]?.pendingRequest?.prompt).toBe("first");
+		expect(prompt.question.mock.calls.map(([label]) => label)).toEqual([
+			"agent> ",
+			"agent> ",
+			"agent> ",
+			"agent [· compacted]> ",
+		]);
+	});
+	it("shows the latest exact usage in the next prompt", async () => {
+		const { store } = await createStore();
+		const prompt = promptWith(["first", "quit"]);
+		const agent = async (
+			userPrompt: string,
+			_journal: Journal,
+			_requestNumber: number,
+			options: AgentRunOptions = {},
+		) => {
+			options.onContextMeasured?.(42_103);
+			return {
+				answer: "done",
+				input: [{ role: "user" as const, content: userPrompt }],
+				model: "test-model",
+			};
+		};
+		await runCli(prompt, journalWith(), store, () => agent, new EventEmitter());
+		expect(prompt.question.mock.calls.map(([label]) => label)).toEqual([
+			"agent> ",
+			"agent [context 42,103]> ",
+		]);
+	});
+
+	it("shows the budget percentage after exact measurement", async () => {
+		const { store } = await createStore();
+		const prompt = promptWith(["first", "quit"]);
+		const agent = async (
+			userPrompt: string,
+			_journal: Journal,
+			_requestNumber: number,
+			options: AgentRunOptions = {},
+		) => {
+			options.onContextMeasured?.(42_103);
+			return {
+				answer: "done",
+				input: [{ role: "user" as const, content: userPrompt }],
+				model: "test-model",
+			};
+		};
+		await runCli(
+			prompt,
+			journalWith(),
+			store,
+			() => agent,
+			new EventEmitter(),
+			async () => undefined,
+			"test-model",
+			100_000,
+		);
+		expect(prompt.question.mock.calls.map(([label]) => label)).toEqual([
+			"agent> ",
+			"agent [context 42,103/100,000 · 42%]> ",
+		]);
+	});
+
+	it("reports a hard budget block and retains incomplete request metadata", async () => {
+		const { store } = await createStore();
+		const agent = vi.fn(
+			async (
+				_prompt: string,
+				_journal: Journal,
+				_requestNumber: number,
+				options: AgentRunOptions = {},
+			) => {
+				options.onContextMeasured?.(101);
+				options.onContextWarning?.(101, 100);
+				throw new ContextBudgetExceededError(101, 100);
+			},
+		);
+		await runCli(
+			promptWith(["blocked", "quit"]),
+			journalWith(),
+			store,
+			() => agent,
+			new EventEmitter(),
+			async () => undefined,
+			"test-model",
+			100,
+		);
+		expect(console.error).toHaveBeenCalledWith(
+			expect.stringContaining("Context Budget exceeded"),
+		);
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("80%"));
+		expect((await store.listConversations()).conversations[0]).toMatchObject({
+			input: [],
+			pendingRequest: { prompt: "blocked", tools: [] },
+		});
+	});
+
 	it("cancels history without replacing the active conversation", async () => {
 		const { store } = await createStore();
 		await store.commitCheckpoint(
@@ -219,7 +430,7 @@ describe("runCli", () => {
 		});
 	});
 
-	it("shows recovery warnings and resumes only the stable checkpoint", async () => {
+	it("shows recovery warnings and blocks model work while a restored tool is started", async () => {
 		const { store } = await createStore();
 		const stableInput = [{ role: "user" as const, content: "stable request" }];
 		const completed = await store.commitCheckpoint(
@@ -265,10 +476,19 @@ describe("runCli", () => {
 		expect(console.error).toHaveBeenCalledWith(
 			"WARNING: conversation last used old-model; current model is current-model.",
 		);
-		expect((await store.loadConversation(pending.id)).input).toEqual([
-			...stableInput,
-			{ role: "user", content: "fresh request" },
-		]);
+		expect(console.error).toHaveBeenCalledWith(
+			"WARNING: a started tool blocks the next model call.",
+		);
+		expect((await store.loadConversation(pending.id)).input).toEqual(
+			stableInput,
+		);
+		expect(
+			(await store.loadConversation(pending.id)).pendingRequest?.tools,
+		).toContainEqual({
+			callId: "call-started",
+			name: "write",
+			status: "started",
+		});
 	});
 
 	it("keeps the active conversation when the selected file changes before loading", async () => {
@@ -732,4 +952,43 @@ describe("runCli", () => {
 		expect(prompt.close).toHaveBeenCalledOnce();
 		expect(finish).not.toHaveBeenCalled();
 	});
+});
+
+describe("context budget", () => {
+	it("leaves an absent budget unset", () => {
+		expect(parseContextBudget(undefined)).toBeUndefined();
+	});
+
+	it("parses a positive safe integer", () => {
+		expect(parseContextBudget("100000")).toBe(100_000);
+	});
+
+	it.each(["", "0", "-1", "1.5", "abc", "9007199254740992"])(
+		"rejects an invalid budget: %s",
+		(value) => {
+			expect(() => parseContextBudget(value)).toThrow(
+				"MICRO_AGENT_CONTEXT_BUDGET must be a positive safe integer",
+			);
+		},
+	);
+
+	it.each([
+		{ tokens: undefined, budget: undefined, expected: "agent> " },
+		{ tokens: undefined, budget: 100_000, expected: "agent> " },
+		{
+			tokens: 42_103,
+			budget: undefined,
+			expected: "agent [context 42,103]> ",
+		},
+		{
+			tokens: 42_103,
+			budget: 100_000,
+			expected: "agent [context 42,103/100,000 · 42%]> ",
+		},
+	])(
+		"formats exact context state: $expected",
+		({ tokens, budget, expected }) => {
+			expect(formatAgentPrompt(tokens, budget)).toBe(expected);
+		},
+	);
 });
