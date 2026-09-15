@@ -1,5 +1,9 @@
 import { isCancel, select } from "@clack/prompts";
-import { type AgentResult, createAgent } from "./agent.js";
+import {
+	type AgentResult,
+	ContextBudgetExceededError,
+	createAgent,
+} from "./agent.js";
 import type { ConversationState, ConversationStore } from "./conversations.js";
 import type { Journal } from "./journal.js";
 
@@ -215,6 +219,15 @@ export async function runCli(
 				const result = await agent(prompt, journal, requestNumber, {
 					conversationId: conversation.id,
 					signal: controller.signal,
+					...(contextBudget === undefined ? {} : { contextBudget }),
+					onContextMeasured: (inputTokens) => {
+						latestInputTokens = inputTokens;
+					},
+					onContextWarning: (inputTokens, budget) => {
+						console.error(
+							`WARNING: context usage is ${inputTokens}/${budget} tokens (at least 80%).`,
+						);
+					},
 					onToolStarted: async (tool) => {
 						conversation = await conversationStore.markToolStarted(
 							conversation,
@@ -242,10 +255,12 @@ export async function runCli(
 						"UNSAVED: final checkpoint persistence failed; later work is blocked.",
 					);
 				}
-			} catch {
+			} catch (error) {
 				if (!stopping) {
 					console.error(
-						"Request failed; checkpoint was not advanced. See the journal for details.",
+						error instanceof ContextBudgetExceededError
+							? error.message
+							: "Request failed; checkpoint was not advanced. See the journal for details.",
 					);
 				}
 			} finally {

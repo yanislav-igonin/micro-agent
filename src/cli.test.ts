@@ -6,6 +6,7 @@ import type { ResponseInput } from "openai/resources/responses/responses";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AgentRunOptions } from "./agent.js";
+import { ContextBudgetExceededError } from "./agent.js";
 import { formatAgentPrompt, parseContextBudget, runCli } from "./cli.js";
 import { createConversationStore } from "./conversations.js";
 import { createJournal, type Journal } from "./journal.js";
@@ -30,7 +31,7 @@ function journalWith(
 
 function promptWith(answers: string[]) {
 	return Object.assign(new EventEmitter(), {
-		question: vi.fn(async () => answers.shift() ?? "quit"),
+		question: vi.fn(async (_query: string) => answers.shift() ?? "quit"),
 		pause: vi.fn(),
 		resume: vi.fn(),
 		close: vi.fn(),
@@ -72,6 +73,95 @@ afterEach(async () => {
 });
 
 describe("runCli", () => {
+	it("shows the latest exact usage in the next prompt", async () => {
+		const { store } = await createStore();
+		const prompt = promptWith(["first", "quit"]);
+		const agent = async (
+			userPrompt: string,
+			_journal: Journal,
+			_requestNumber: number,
+			options: AgentRunOptions = {},
+		) => {
+			options.onContextMeasured?.(42_103);
+			return {
+				answer: "done",
+				input: [{ role: "user" as const, content: userPrompt }],
+				model: "test-model",
+			};
+		};
+		await runCli(prompt, journalWith(), store, () => agent, new EventEmitter());
+		expect(prompt.question.mock.calls.map(([label]) => label)).toEqual([
+			"agent> ",
+			"agent [context 42,103]> ",
+		]);
+	});
+
+	it("shows the budget percentage after exact measurement", async () => {
+		const { store } = await createStore();
+		const prompt = promptWith(["first", "quit"]);
+		const agent = async (
+			userPrompt: string,
+			_journal: Journal,
+			_requestNumber: number,
+			options: AgentRunOptions = {},
+		) => {
+			options.onContextMeasured?.(42_103);
+			return {
+				answer: "done",
+				input: [{ role: "user" as const, content: userPrompt }],
+				model: "test-model",
+			};
+		};
+		await runCli(
+			prompt,
+			journalWith(),
+			store,
+			() => agent,
+			new EventEmitter(),
+			async () => undefined,
+			"test-model",
+			100_000,
+		);
+		expect(prompt.question.mock.calls.map(([label]) => label)).toEqual([
+			"agent> ",
+			"agent [context 42,103/100,000 · 42%]> ",
+		]);
+	});
+
+	it("reports a hard budget block and retains incomplete request metadata", async () => {
+		const { store } = await createStore();
+		const agent = vi.fn(
+			async (
+				_prompt: string,
+				_journal: Journal,
+				_requestNumber: number,
+				options: AgentRunOptions = {},
+			) => {
+				options.onContextMeasured?.(101);
+				options.onContextWarning?.(101, 100);
+				throw new ContextBudgetExceededError(101, 100);
+			},
+		);
+		await runCli(
+			promptWith(["blocked", "quit"]),
+			journalWith(),
+			store,
+			() => agent,
+			new EventEmitter(),
+			async () => undefined,
+			"test-model",
+			100,
+		);
+		expect(console.error).toHaveBeenCalledWith(
+			expect.stringContaining("Context Budget exceeded"),
+		);
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("80%"));
+		expect((await store.listConversations()).conversations[0]).toMatchObject({
+			input: [],
+			pendingRequest: { prompt: "blocked", tools: [] },
+		});
+	});
+
 	it("cancels history without replacing the active conversation", async () => {
 		const { store } = await createStore();
 		await store.commitCheckpoint(

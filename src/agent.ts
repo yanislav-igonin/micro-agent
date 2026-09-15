@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import type { InputTokenCountParams } from "openai/resources/responses/input-tokens";
 import type {
 	Response,
 	ResponseCreateParamsNonStreaming,
@@ -13,6 +14,15 @@ import {
 } from "./tools.js";
 
 let openai: OpenAI | undefined;
+
+export class ContextBudgetExceededError extends Error {
+	constructor(inputTokens: number, budget: number) {
+		super(
+			`Context Budget exceeded: ${inputTokens}/${budget} input tokens. Use /new, increase MICRO_AGENT_CONTEXT_BUDGET, or wait for future compaction.`,
+		);
+		this.name = "ContextBudgetExceededError";
+	}
+}
 
 const SYSTEM_PROMPT = `
 You are a small coding agent.
@@ -40,6 +50,9 @@ When you have enough information, answer the user.
 export interface AgentRunOptions {
 	conversationId?: string;
 	signal?: AbortSignal;
+	contextBudget?: number;
+	onContextMeasured?: (inputTokens: number) => void;
+	onContextWarning?: (inputTokens: number, budget: number) => void;
 	onToolStarted?: (tool: { callId: string; name: string }) => Promise<void>;
 	onToolFinished?: (callId: string) => Promise<void>;
 }
@@ -52,6 +65,28 @@ export interface AgentResult {
 
 export function createAgent(restoredInput: ResponseInput = []) {
 	let checkpointInput = structuredClone(restoredInput);
+	let exactMeasurement:
+		| { inputTokens: number; requestBytes: number; model: string }
+		| undefined;
+	let highUsageWarningShown = false;
+
+	function publishExactMeasurement(
+		inputTokens: number,
+		requestBytes: number,
+		model: string,
+		options: AgentRunOptions,
+	) {
+		exactMeasurement = { inputTokens, requestBytes, model };
+		options.onContextMeasured?.(inputTokens);
+		const budget = options.contextBudget;
+		if (budget === undefined) return;
+		if (inputTokens < budget * 0.8) {
+			highUsageWarningShown = false;
+		} else if (!highUsageWarningShown) {
+			highUsageWarningShown = true;
+			options.onContextWarning?.(inputTokens, budget);
+		}
+	}
 
 	return async (
 		userPrompt: string,
@@ -65,6 +100,8 @@ export function createAgent(restoredInput: ResponseInput = []) {
 			journal,
 			requestNumber,
 			options,
+			() => exactMeasurement,
+			publishExactMeasurement,
 		);
 		checkpointInput = structuredClone(result.input);
 		return result;
@@ -77,6 +114,15 @@ async function runAgent(
 	journal: Journal,
 	requestNumber: number,
 	options: AgentRunOptions,
+	getExactMeasurement: () =>
+		| { inputTokens: number; requestBytes: number; model: string }
+		| undefined,
+	publishExactMeasurement: (
+		inputTokens: number,
+		requestBytes: number,
+		model: string,
+		options: AgentRunOptions,
+	) => void,
 ) {
 	const input = structuredClone(checkpointInput);
 	const context = {
@@ -97,17 +143,56 @@ async function runAgent(
 			const contextualStep = { ...context, stepNumber };
 			console.log(`[request ${requestNumber} step ${stepNumber}] started`);
 			const model = process.env.OPENAI_MODEL ?? "gpt-5.6-luna";
-			const request: ResponseCreateParamsNonStreaming = {
-				model,
-				instructions: SYSTEM_PROMPT,
-				tools,
-				input,
-			};
+			const request: ResponseCreateParamsNonStreaming & InputTokenCountParams =
+				{
+					model,
+					instructions: SYSTEM_PROMPT,
+					tools,
+					input,
+				};
+			const requestBytes = Buffer.byteLength(JSON.stringify(request), "utf8");
 			await journal.record("model_request", request, contextualStep);
 			let response: Response;
+			let errorPhase: "input_token_count" | "context_budget" | undefined;
 			try {
 				// Initialize after the journal so configuration failures are recorded too.
 				openai ??= new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+				const budget = options.contextBudget;
+				if (budget !== undefined) {
+					const exactMeasurement = getExactMeasurement();
+					const softBoundary = budget * 0.8;
+					// The full request bound also covers tokenization changes at an
+					// append boundary; byte growth alone is not a safe upper bound.
+					const upperBound = exactMeasurement
+						? Math.max(
+								requestBytes,
+								exactMeasurement.inputTokens +
+									Math.max(0, requestBytes - exactMeasurement.requestBytes),
+							)
+						: requestBytes;
+					const preflightNeeded =
+						upperBound >= softBoundary ||
+						(exactMeasurement !== undefined &&
+							(exactMeasurement.model !== model ||
+								requestBytes < exactMeasurement.requestBytes));
+					if (preflightNeeded) {
+						errorPhase = "input_token_count";
+						const count = await openai.responses.inputTokens.count(request, {
+							signal: options.signal,
+						});
+						publishExactMeasurement(
+							count.input_tokens,
+							requestBytes,
+							model,
+							options,
+						);
+						if (count.input_tokens > budget) {
+							errorPhase = "context_budget";
+							throw new ContextBudgetExceededError(count.input_tokens, budget);
+						}
+						errorPhase = undefined;
+					}
+				}
 				response = await openai.responses.create(request, {
 					signal: options.signal,
 				});
@@ -119,13 +204,24 @@ async function runAgent(
 				reason = "model_error";
 				await journal.record(
 					"model_error",
-					normalizeError(error),
+					{
+						...normalizeError(error),
+						...(errorPhase ? { phase: errorPhase } : {}),
+					},
 					contextualStep,
 				);
 				throw error;
 			}
 			options.signal?.throwIfAborted();
 			await journal.record("model_response", response, contextualStep);
+			if (response.usage) {
+				publishExactMeasurement(
+					response.usage.input_tokens,
+					requestBytes,
+					model,
+					options,
+				);
+			}
 
 			// Replay every output item, including reasoning items, on the next step.
 			// SDK 7.10.0 gives AdditionalTools incompatible input/output roles.

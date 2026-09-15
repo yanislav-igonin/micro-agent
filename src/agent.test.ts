@@ -5,11 +5,12 @@ import type { Journal } from "./journal.js";
 
 const openai = vi.hoisted(() => ({
 	create: vi.fn(),
+	count: vi.fn(),
 }));
 
 vi.mock("openai", () => ({
 	default: class {
-		responses = { create: openai.create };
+		responses = { create: openai.create, inputTokens: { count: openai.count } };
 	},
 }));
 
@@ -51,6 +52,7 @@ function journalWith(
 
 beforeEach(() => {
 	openai.create.mockReset();
+	openai.count.mockReset();
 });
 
 afterEach(async () => {
@@ -61,6 +63,248 @@ afterEach(async () => {
 });
 
 describe("createAgent", () => {
+	it("skips preflight for a small request with a large budget", async () => {
+		openai.create.mockResolvedValue({
+			output: [assistantMessage("small", "done")],
+			output_text: "done",
+			usage: { input_tokens: 120 },
+		});
+		await createAgent()("small", journalWith(), 1, {
+			contextBudget: 100_000,
+		});
+		expect(openai.count).not.toHaveBeenCalled();
+		expect(openai.create).toHaveBeenCalledOnce();
+	});
+
+	it("uses first-step response usage to preflight the next tool step", async () => {
+		openai.create
+			.mockResolvedValueOnce({
+				output: [
+					{
+						type: "function_call",
+						name: "read",
+						arguments: "{",
+						call_id: "bad-read",
+					},
+				],
+				output_text: "",
+				usage: { input_tokens: 79_999 },
+			})
+			.mockResolvedValueOnce({
+				output: [assistantMessage("second", "done")],
+				output_text: "done",
+			});
+		openai.count.mockResolvedValue({ input_tokens: 80_050 });
+		await createAgent()("step", journalWith(), 1, {
+			contextBudget: 100_000,
+		});
+		expect(openai.count).toHaveBeenCalledOnce();
+		expect(openai.create).toHaveBeenCalledTimes(2);
+	});
+
+	it("uses prior exact usage to skip a safely low follow-up", async () => {
+		openai.create.mockImplementation(async () => ({
+			output: [assistantMessage("low", "done")],
+			output_text: "done",
+			usage: { input_tokens: 150 },
+		}));
+		const agent = createAgent();
+		await agent("first", journalWith(), 1, { contextBudget: 100_000 });
+		await agent("second", journalWith(), 2, { contextBudget: 100_000 });
+		expect(openai.count).not.toHaveBeenCalled();
+		expect(openai.create).toHaveBeenCalledTimes(2);
+	});
+
+	it("preflights when the complete next request reaches the boundary", async () => {
+		let firstRequestBytes = 0;
+		openai.create.mockImplementation(async (request) => {
+			if (firstRequestBytes === 0) {
+				firstRequestBytes = Buffer.byteLength(JSON.stringify(request), "utf8");
+			}
+			return {
+				output: [assistantMessage("follow-up", "done")],
+				output_text: "done",
+				usage: { input_tokens: 1 },
+			};
+		});
+		openai.count.mockResolvedValue({ input_tokens: 2 });
+		const agent = createAgent();
+		await agent("first", journalWith(), 1);
+		const budget = Math.ceil((firstRequestBytes + 1) / 0.8);
+		await agent("second", journalWith(), 2, { contextBudget: budget });
+		expect(openai.count).toHaveBeenCalledOnce();
+	});
+
+	it("preflights after the model changes because the prior count cannot apply", async () => {
+		process.env.OPENAI_MODEL = "model-a";
+		openai.create.mockImplementation(async () => ({
+			output: [assistantMessage("model-change", "done")],
+			output_text: "done",
+			usage: { input_tokens: 150 },
+		}));
+		openai.count.mockResolvedValue({ input_tokens: 200 });
+		const agent = createAgent();
+		await agent("first", journalWith(), 1, { contextBudget: 100_000 });
+		process.env.OPENAI_MODEL = "model-b";
+		await agent("second", journalWith(), 2, { contextBudget: 100_000 });
+		expect(openai.count).toHaveBeenCalledOnce();
+		expect(openai.count.mock.calls[0]?.[0].model).toBe("model-b");
+	});
+
+	it("preflights the complete pending request when the soft boundary is at risk", async () => {
+		let countedRequest: unknown;
+		let createdRequest: unknown;
+		openai.count.mockImplementation(async (request) => {
+			countedRequest = structuredClone(request);
+			return { input_tokens: 70 };
+		});
+		openai.create.mockImplementation(async (request) => {
+			createdRequest = structuredClone(request);
+			return {
+				output: [assistantMessage("risky", "done")],
+				output_text: "done",
+				usage: { input_tokens: 72 },
+			};
+		});
+		const onContextMeasured = vi.fn();
+		await createAgent()("risk", journalWith(), 1, {
+			contextBudget: 100,
+			onContextMeasured,
+		});
+		expect(openai.count).toHaveBeenCalledOnce();
+		expect(countedRequest).toEqual(createdRequest);
+		expect(countedRequest).toMatchObject({
+			model: expect.any(String),
+			instructions: expect.any(String),
+			tools: expect.any(Array),
+			input: [{ role: "user", content: "risk" }],
+		});
+		expect(createdRequest).not.toHaveProperty("truncation");
+		expect(onContextMeasured.mock.calls.map(([tokens]) => tokens)).toEqual([
+			70, 72,
+		]);
+	});
+
+	it("blocks an exact count above budget and keeps the stable checkpoint", async () => {
+		openai.count
+			.mockResolvedValueOnce({ input_tokens: 101 })
+			.mockResolvedValueOnce({ input_tokens: 10 });
+		let createdInput: unknown;
+		openai.create.mockImplementation(async (request) => {
+			createdInput = structuredClone(request.input);
+			return {
+				output: [assistantMessage("recovered", "done")],
+				output_text: "done",
+			};
+		});
+		const agent = createAgent([{ role: "user", content: "stable" }]);
+		const onContextMeasured = vi.fn();
+		await expect(
+			agent("blocked", journalWith(), 1, {
+				contextBudget: 100,
+				onContextMeasured,
+			}),
+		).rejects.toThrow("Context Budget");
+		expect(openai.create).not.toHaveBeenCalled();
+		expect(onContextMeasured).toHaveBeenCalledWith(101);
+		await agent("fresh", journalWith(), 2, { contextBudget: 100 });
+		expect(createdInput).toEqual([
+			{ role: "user", content: "stable" },
+			{ role: "user", content: "fresh" },
+		]);
+	});
+
+	it("allows an exact count equal to the budget", async () => {
+		openai.count.mockResolvedValue({ input_tokens: 100 });
+		openai.create.mockResolvedValue({
+			output: [assistantMessage("at-budget", "done")],
+			output_text: "done",
+		});
+		await createAgent()("at budget", journalWith(), 1, {
+			contextBudget: 100,
+		});
+		expect(openai.create).toHaveBeenCalledOnce();
+	});
+
+	it("records failed required preflight and never calls the model", async () => {
+		const records: Array<{ type: string; data: unknown; context: unknown }> =
+			[];
+		openai.count
+			.mockRejectedValueOnce(new Error("count failed"))
+			.mockResolvedValueOnce({ input_tokens: 10 });
+		let recoveredInput: unknown;
+		openai.create.mockImplementation(async (request) => {
+			recoveredInput = structuredClone(request.input);
+			return {
+				output: [assistantMessage("after-count-failure", "done")],
+				output_text: "done",
+			};
+		});
+		const agent = createAgent([{ role: "user", content: "stable" }]);
+		await expect(
+			agent("large", journalWith(records), 1, {
+				contextBudget: 100,
+			}),
+		).rejects.toThrow("count failed");
+		expect(openai.create).not.toHaveBeenCalled();
+		expect(
+			records.find(({ type }) => type === "model_error")?.data,
+		).toMatchObject({
+			phase: "input_token_count",
+		});
+		await agent("fresh", journalWith(), 2, { contextBudget: 100 });
+		expect(recoveredInput).toEqual([
+			{ role: "user", content: "stable" },
+			{ role: "user", content: "fresh" },
+		]);
+	});
+
+	it("warns once per high-usage period and resets after an exact low count", async () => {
+		openai.count
+			.mockResolvedValueOnce({ input_tokens: 80 })
+			.mockResolvedValueOnce({ input_tokens: 90 })
+			.mockResolvedValueOnce({ input_tokens: 79 })
+			.mockResolvedValueOnce({ input_tokens: 80 });
+		openai.create.mockImplementation(async () => ({
+			output: [assistantMessage("answer", "done")],
+			output_text: "done",
+		}));
+		const onContextWarning = vi.fn();
+		const agent = createAgent();
+		for (const prompt of ["one", "two", "three", "four"]) {
+			await agent(prompt, journalWith(), 1, {
+				contextBudget: 100,
+				onContextWarning,
+			});
+		}
+		expect(onContextWarning.mock.calls).toEqual([
+			[80, 100],
+			[80, 100],
+		]);
+	});
+
+	it("publishes exact input usage from a successful response", async () => {
+		openai.create.mockResolvedValue({
+			output: [assistantMessage("message-usage", "done")],
+			output_text: "done",
+			usage: { input_tokens: 321 },
+		});
+		const onContextMeasured = vi.fn();
+		await createAgent()("measure", journalWith(), 1, { onContextMeasured });
+		expect(onContextMeasured).toHaveBeenCalledOnce();
+		expect(onContextMeasured).toHaveBeenCalledWith(321);
+	});
+
+	it("leaves the last measurement alone when response usage is absent", async () => {
+		openai.create.mockResolvedValue({
+			output: [assistantMessage("message-no-usage", "done")],
+			output_text: "done",
+		});
+		const onContextMeasured = vi.fn();
+		await createAgent()("measure", journalWith(), 1, { onContextMeasured });
+		expect(onContextMeasured).not.toHaveBeenCalled();
+	});
+
 	it("continues restored input with current runtime configuration", async () => {
 		process.env.OPENAI_MODEL = "current-model";
 		const restoredAnswer = assistantMessage("message-old", "old answer");
