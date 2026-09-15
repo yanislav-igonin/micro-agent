@@ -309,10 +309,10 @@ git add README.md docs/superpowers/plans/2026-09-15-context-budget-preflight.md
 git commit -m "docs: explain context budget"
 ```
 
-- [ ] **Step 5: Run post-commit verification**
+- [x] **Step 5: Run post-commit verification**
 
 Run `pnpm test`, `pnpm exec tsc --noEmit`, `pnpm lint`, and `git status --short --branch`.
 
-- [ ] **Step 6: Update Linear only after verification**
+- [x] **Step 6: Update Linear only after verification**
 
 Set PRI-295 to Done with `linear_save_issue(state: "Done")`, verify with `linear_get_issue`, and leave PRI-296 in Backlog. Do not create a PR or MR unless explicitly requested.
