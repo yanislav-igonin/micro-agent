@@ -91,6 +91,8 @@ Vitest is the test runner; tests are colocated as `*.test.ts` and run with `pnpm
 
 History mixes two shapes: merged features use `Feature - <topic> (#N)`, and small changes use short informal subjects such as `write/append file`. Write concise, descriptive subjects and keep commits focused. The `pre-commit` hook rewrites staged files through Biome, so review its edits before committing.
 
+**Work always reaches `master` as one commit per feature.** A feature branch is squashed into a single `Feature - <topic> (#N)` commit whose body lists the branch's own commits. Never fast-forward and never `--no-ff` merge a feature branch into `master`: its intermediate commits are scaffolding for review, not project history. Check the existing shape with `git log --oneline master` before merging, and confirm afterwards that the merge produced one commit.
+
 For pull requests, describe the behavior changed, link relevant issues, and list validation performed and any known failures. Create requests only when explicitly requested, from a non-default branch with committed changes.
 
 ## Security & Configuration
