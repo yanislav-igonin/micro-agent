@@ -15,14 +15,36 @@ the first exact measurement, `agent [context 42,103]> ` without a budget, or
 `agent [context 42,103/100,000 · 42%]> ` with one. These counts come only from
 Responses API usage or exact input-token preflight; local bounds never appear in
 the prompt. With no budget, the agent shows raw usage without a percentage or limit.
+After a successful compaction the next prompt adds a one-shot `· compacted` marker,
+for example `agent [context 12,430/100,000 · 12% · compacted]> `; the marker
+disappears after that prompt.
 
 With a budget, a conservative local size check triggers exact preflight when input
 could reach 80% of the limit. The agent warns once per period at or above 80%, then
-resets that warning after exact usage falls below 80%. An exact preflight count above
-100% blocks the model call and leaves the last complete conversation checkpoint
-unchanged. A required preflight failure also stops the model call. The CLI suggests
-`/new`, raising `MICRO_AGENT_CONTEXT_BUDGET`, or future compaction after a hard
-block. Automatic truncation and compaction are disabled.
+resets that warning after exact usage falls below 80%.
+
+At or above 80% of the budget, Micro Agent compacts before the model call rather than
+sending that input as is. Compaction calls the native Responses compact API, validates
+the returned `response.compaction` payload, saves the result atomically as the new
+conversation checkpoint, and re-measures the input. If the compacted input still
+exceeds 100% of the budget, the model call is blocked. An exact count above 100%
+without a successful compaction also blocks the call and leaves the last complete
+checkpoint unchanged, and a failed required preflight stops the call without guessing.
+After a hard block the CLI prints `Context Budget exceeded: <input>/<budget> input
+tokens. Use /new or increase MICRO_AGENT_CONTEXT_BUDGET.`
+
+Compaction runs only at a model step boundary, after every emitted tool call has a
+result; a tool recorded as `started` blocks it. History is never truncated silently:
+compaction is the only operation that replaces older model input, and it never
+rewrites the journal. The pre-compaction input survives only in the journal, so with
+`--no-log` it is not recoverable.
+
+Compaction failure is strict. If the compact API call or payload validation fails, the
+journal records `compaction_failed`, the previous checkpoint stays intact, no model
+call is attempted, and nothing is retried automatically. If compaction succeeds but
+saving the compacted checkpoint fails, the CLI reports `UNSAVED`, keeps the compacted
+input in memory, blocks further requests and conversation switching, and retries only
+that same save; the compact API is never called again for it.
 
 ## Work journal
 
@@ -47,6 +69,11 @@ cli_started
 cli_finished
 ```
 
+With compaction, `compaction_started` precedes the compact API call inside the same
+model step, and `compaction_finished` or `compaction_failed` follows it.
+`compaction_failed.data.phase` names the failing stage: `compact_api`, `validation`,
+`checkpoint_save`, or `post_compaction_preflight`.
+
 `model_request.data` contains the exact Responses create parameters, including
 full input, instructions and tool schemas. `model_response.data` contains the
 full serializable SDK response. `tool_started.data.arguments` is the raw JSON
@@ -56,27 +83,36 @@ succeeded. Tool events use the original model `call_id` as `callId`.
 Tool results contain `status` (`ok` or `error`) and a string `output`; errors also
 include normalized error details and a `phase` (`argument_parsing` or `execution`).
 Invalid JSON never executes a tool and returns `ERROR: Invalid tool arguments`
-to the model. Successful write/append operations return `OK`. Tool errors are
-returned to the model and allow the cycle to continue, including shell failures
-with their stdout and stderr preserved.
+to the model. Successful `write`, `edit` (append), and `replace` calls return exactly
+`OK`. Tool errors are returned to the model and allow the cycle to continue, including
+shell failures with their stdout and stderr preserved.
 
 Each tool execution has two output representations. `tool_finished.data.output`
 keeps the complete captured result for diagnosis, while
 `tool_finished.data.modelOutput` is the bounded representation appended to model
 input and saved in conversation checkpoints. Truncation metadata records the
-strategy and exact shown and omitted character counts. With `--no-log`, omitted
-raw content is not recoverable.
+strategy (`none`, `range`, or `head_tail`) and exact shown and omitted character
+counts. Every tool result has a 20,000-character model-visible ceiling, including
+`write`, `edit`, and `replace` error output. With `--no-log`, omitted raw content is
+not recoverable.
 
 `read` returns at most 200 lines and 20,000 Unicode characters. Its header reports
-one-based line/column coordinates and an exact `next` position. `run` keeps small
-results exact; large model-visible results contain the first and last 10,000
-characters around an omission marker. `replace` edits a file only when its literal
-`oldText` occurs exactly once.
+one-based line/column coordinates and an exact `next` position. `run` executes the
+command with the CLI user's permissions, a 10-second timeout, and a 1 MiB output
+buffer; it keeps small results exact, while larger model-visible results contain the
+first and last 10,000 characters around an omission marker. `replace` edits a file
+only when its literal `oldText` occurs exactly once, and `edit` appends to a file
+instead of rewriting it.
 
 `user_request_finished.data.reason` is `final_answer`, `max_steps`, `model_error`,
-`unexpected_error`, or `cancelled`. SIGINT aborts an active model request. An API
-failure emits `model_error` before finishing the request. Missing finish events
-indicate an interrupted action or incomplete journal. No repair is attempted.
+`compaction_error`, `unexpected_error`, or `cancelled`. `max_steps` means the
+20-step limit was reached. `compaction_error` covers every failure inside the
+compaction path: the compact API call, payload validation, the compacted-checkpoint
+save, and the post-compaction re-measure. Each of them also records
+`compaction_failed` with its failing `phase`. SIGINT aborts an active model request
+and reports `cancelled`. An API failure emits `model_error` before finishing the
+request. Missing finish events indicate an interrupted action or incomplete journal.
+No repair is attempted.
 
 The terminal shows progress, tool statuses, stop reasons, and the final answer.
 On the first journal creation or write failure, one warning appears and logging
@@ -95,6 +131,10 @@ the CLI creates `conversations/<id>.json` and records the pending request. It re
 tool status before and after execution, then atomically commits the exact Responses
 input only after a final answer. Failed or interrupted requests leave the previous
 checkpoint intact and are never replayed automatically.
+
+Compaction commits through the same store: after a structurally valid compact
+response, the checkpoint is replaced with the compacted model input and never keeps a
+second full-history copy. The pre-compaction input remains only in the journal.
 
 If the final checkpoint cannot be saved, the CLI prints `UNSAVED`, retains the
 advanced input in memory, and blocks later requests until the same checkpoint saves.
@@ -152,6 +192,14 @@ permissions and `--no-log` as well.
 Also verify `/history` with arrow keys, Enter, and Escape; its empty and corrupt-file
 states; repeated switching; `/new`; normal exit; newest-first reordering; incomplete
 request recovery; a model mismatch; and a project file changed after the checkpoint.
+
+To verify compaction, set a small `MICRO_AGENT_CONTEXT_BUDGET` in a disposable project
+and drive a conversation past 80% of it. Confirm `compaction_started` is followed by
+`compaction_finished` with before and after sizes, the one-shot `· compacted` prompt
+marker, and a checkpoint that now holds only the compacted input. Then force a compact
+failure and confirm `compaction_failed` with its `phase`, reason `compaction_error`, and
+an unchanged previous checkpoint. Interrupting a request with a tool still `started`
+must not compact.
 
 For deterministic malformed arguments, model failures and the 20-step limit,
 point the SDK's `OPENAI_BASE_URL` at a local HTTP fixture serving Responses payloads
