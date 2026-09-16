@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import type { ResponseInput } from "openai/resources/responses/responses";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createConversationStore } from "./conversations.js";
+import { Conversation, ConversationStore } from "./conversations.js";
 
 const roots: string[] = [];
 const execFileAsync = promisify(execFile);
@@ -27,23 +27,18 @@ async function createStore() {
 	roots.push(root);
 	return {
 		root,
-		store: await createConversationStore(root),
+		store: await ConversationStore.open(root),
 	};
 }
 
-describe("createConversationStore", () => {
+describe("ConversationStore", () => {
 	it("atomically replaces old input with a restorable compacted window and retains pending work", async () => {
 		const { root, store } = await createStore();
 		const old = [{ role: "user" as const, content: "old goal PRI-296" }];
-		const committed = await store.commitCheckpoint(
-			await store.startRequest(store.createConversation(), "old goal"),
-			old,
-			"test-model",
-		);
-		const pending = await store.startRequest(
-			committed,
-			"continue verification",
-		);
+		const committed = store.create();
+		await committed.startRequest("old goal");
+		await committed.commitCheckpoint(old, "test-model");
+		const pending = await committed.startRequest("continue verification");
 		const compacted = [
 			{
 				id: "msg-kept",
@@ -56,12 +51,11 @@ describe("createConversationStore", () => {
 			},
 			{ type: "compaction" as const, id: "cmp-1", encrypted_content: "opaque" },
 		] as ResponseInput;
-		const saved = await store.saveCompactionCheckpoint(
-			pending,
+		const saved = await pending.saveCompactionCheckpoint(
 			compacted,
 			"test-model",
 		);
-		const restored = await store.loadConversation(saved.id);
+		const restored = await store.load(saved.id);
 		expect(restored.input).toEqual(compacted);
 		expect(restored.pendingRequest?.prompt).toBe("continue verification");
 		expect(JSON.stringify(restored)).not.toContain("old goal PRI-296");
@@ -77,23 +71,21 @@ describe("createConversationStore", () => {
 
 	it("refuses compact checkpoint saves while a tool is started", async () => {
 		const { store } = await createStore();
-		const started = await store.markToolStarted(
-			await store.startRequest(store.createConversation(), "goal"),
-			{ callId: "call-1", name: "write" },
-		);
+		const started = store.create();
+		await started.startRequest("goal");
+		await started.markToolStarted({ callId: "call-1", name: "write" });
 		await expect(
-			store.saveCompactionCheckpoint(
-				started,
+			started.saveCompactionCheckpoint(
 				[{ type: "compaction", id: "cmp", encrypted_content: "opaque" }],
 				"test-model",
 			),
 		).rejects.toThrow("Started tool");
-		expect((await store.loadConversation(started.id)).input).toEqual([]);
+		expect((await store.load(started.id)).input).toEqual([]);
 	});
 	it("does not create a state file for an empty conversation", async () => {
 		const { root, store } = await createStore();
 
-		const conversation = store.createConversation();
+		const conversation = store.create();
 
 		expect(conversation).toMatchObject({
 			schemaVersion: 1,
@@ -107,10 +99,9 @@ describe("createConversationStore", () => {
 
 	it("starts the first request with a stable normalized title", async () => {
 		const { root, store } = await createStore();
-		const conversation = store.createConversation();
+		const conversation = store.create();
 
-		const pending = await store.startRequest(
-			conversation,
+		const pending = await conversation.startRequest(
 			"  Inspect\n\tthe   failure  ",
 		);
 
@@ -123,21 +114,17 @@ describe("createConversationStore", () => {
 			tools: [],
 		});
 		const statePath = path.join(root, "conversations", `${pending.id}.json`);
-		expect(JSON.parse(await fs.readFile(statePath, "utf8"))).toEqual(pending);
+		expect(JSON.parse(await fs.readFile(statePath, "utf8"))).toEqual({
+			...pending,
+		});
 	});
 
 	it("limits the stable title to 50 Unicode code points", async () => {
 		const { store } = await createStore();
-		const conversation = store.createConversation();
+		const conversation = store.create();
 
-		const firstPending = await store.startRequest(
-			conversation,
-			"😀".repeat(51),
-		);
-		const secondPending = await store.startRequest(
-			firstPending,
-			"different title",
-		);
+		const firstPending = await conversation.startRequest("😀".repeat(51));
+		const secondPending = await firstPending.startRequest("different title");
 
 		expect(firstPending.title).toBe(`${"😀".repeat(49)}…`);
 		expect(Array.from(firstPending.title)).toHaveLength(50);
@@ -146,31 +133,28 @@ describe("createConversationStore", () => {
 
 	it("persists pending tool started and finished transitions", async () => {
 		const { store } = await createStore();
-		const conversation = store.createConversation();
-		const pending = await store.startRequest(conversation, "Inspect project");
+		const conversation = store.create();
+		await conversation.startRequest("Inspect project");
 
-		const started = await store.markToolStarted(pending, {
-			callId: "call-1",
-			name: "read",
-		});
-		const finished = await store.markToolFinished(started, "call-1");
-
-		expect(started.revision).toBe(2);
-		expect(started.pendingRequest?.tools).toEqual([
+		await conversation.markToolStarted({ callId: "call-1", name: "read" });
+		expect(conversation.revision).toBe(2);
+		expect(conversation.pendingRequest?.tools).toEqual([
 			{ callId: "call-1", name: "read", status: "started" },
 		]);
-		expect(finished.revision).toBe(3);
-		expect(finished.pendingRequest?.tools).toEqual([
+
+		await conversation.markToolFinished("call-1");
+		expect(conversation.revision).toBe(3);
+		expect(conversation.pendingRequest?.tools).toEqual([
+			{ callId: "call-1", name: "read", status: "finished" },
+		]);
+		expect((await store.load(conversation.id)).pendingRequest?.tools).toEqual([
 			{ callId: "call-1", name: "read", status: "finished" },
 		]);
 	});
 
 	it("round-trips mixed Responses input in a completed checkpoint", async () => {
 		const { store } = await createStore();
-		const pending = await store.startRequest(
-			store.createConversation(),
-			"Read the project",
-		);
+		const pending = await store.create().startRequest("Read the project");
 		const input = [
 			{ role: "user", content: "Read the project" },
 			{
@@ -206,48 +190,45 @@ describe("createConversationStore", () => {
 			},
 		] as ResponseInput;
 
-		const committed = await store.commitCheckpoint(pending, input, "gpt-test");
-		const loaded = await store.loadConversation(committed.id);
+		const committed = await pending.commitCheckpoint(input, "gpt-test");
+		const loaded = await store.load(committed.id);
 
 		expect(committed).toMatchObject({
 			revision: 2,
 			lastModel: "gpt-test",
 			pendingRequest: null,
 		});
-		expect(loaded).toEqual(committed);
+		expect(loaded).toEqual({ ...committed });
 		expect(loaded.input).toEqual(input);
 	});
 
 	it("rejects a stale revision without changing the saved state", async () => {
 		const { store } = await createStore();
-		const pending = await store.startRequest(
-			store.createConversation(),
-			"First request",
+		const conversation = store.create();
+		await conversation.startRequest("First request");
+		const stale = new Conversation(store, await store.load(conversation.id));
+		const current = await conversation.commitCheckpoint([], "gpt-current");
+
+		await expect(stale.commitCheckpoint([], "gpt-stale")).rejects.toThrow(
+			"Conversation revision mismatch: expected 1, found 2",
 		);
-		const current = await store.commitCheckpoint(pending, [], "gpt-current");
 
-		await expect(
-			store.commitCheckpoint(pending, [], "gpt-stale"),
-		).rejects.toThrow("Conversation revision mismatch: expected 1, found 2");
-
-		expect(await store.loadConversation(current.id)).toEqual(current);
+		expect(await store.load(current.id)).toEqual({ ...current });
 	});
 
 	it("keeps the previous checkpoint readable when atomic rename fails", async () => {
 		const { store } = await createStore();
-		const current = await store.commitCheckpoint(
-			await store.startRequest(store.createConversation(), "First request"),
-			[],
-			"gpt-current",
-		);
+		const current = store.create();
+		await current.startRequest("First request");
+		await current.commitCheckpoint([], "gpt-current");
 		vi.spyOn(fs, "rename").mockRejectedValueOnce(new Error("rename failed"));
 
-		await expect(store.startRequest(current, "Next request")).rejects.toThrow(
+		await expect(current.startRequest("Next request")).rejects.toThrow(
 			"rename failed",
 		);
 
 		vi.restoreAllMocks();
-		expect(await store.loadConversation(current.id)).toEqual(current);
+		expect(await store.load(current.id)).toEqual({ ...current });
 	});
 
 	it("does not expose a final state file when first publication fails", async () => {
@@ -255,14 +236,15 @@ describe("createConversationStore", () => {
 			path.join(os.tmpdir(), "micro-agent-conversations-"),
 		);
 		roots.push(root);
-		const store = await createConversationStore(root, {
+		const store = await ConversationStore.open(root, {
 			createId: () => "aaaaaaaaaaaa",
 		});
 		vi.spyOn(fs, "link").mockRejectedValueOnce(new Error("publish failed"));
+		const conversation = store.create();
 
-		await expect(
-			store.startRequest(store.createConversation(), "First request"),
-		).rejects.toThrow("publish failed");
+		await expect(conversation.startRequest("First request")).rejects.toThrow(
+			"publish failed",
+		);
 
 		await expect(
 			fs.stat(path.join(root, "conversations", "aaaaaaaaaaaa.json")),
@@ -274,19 +256,16 @@ describe("createConversationStore", () => {
 			path.join(os.tmpdir(), "micro-agent-conversations-"),
 		);
 		roots.push(root);
-		const store = await createConversationStore(root, {
+		const store = await ConversationStore.open(root, {
 			createId: () => "aaaaaaaaaaaa",
 		});
 		vi.spyOn(fs, "rm").mockRejectedValueOnce(new Error("cleanup failed"));
 
-		const saved = await store.startRequest(
-			store.createConversation(),
-			"First request",
-		);
+		const saved = await store.create().startRequest("First request");
 
 		vi.restoreAllMocks();
 		expect(saved.id).toBe("aaaaaaaaaaaa");
-		expect(await store.loadConversation(saved.id)).toEqual(saved);
+		expect(await store.load(saved.id)).toEqual({ ...saved });
 	});
 
 	it("retries exclusive first-file creation when an ID collides", async () => {
@@ -295,16 +274,13 @@ describe("createConversationStore", () => {
 		);
 		roots.push(root);
 		const ids = ["aaaaaaaaaaaa", "bbbbbbbbbbbb"];
-		const store = await createConversationStore(root, {
+		const store = await ConversationStore.open(root, {
 			createId: () => ids.shift() ?? "cccccccccccc",
 		});
 		const collisionPath = path.join(root, "conversations", "aaaaaaaaaaaa.json");
 		await fs.writeFile(collisionPath, "occupied");
 
-		const saved = await store.startRequest(
-			store.createConversation(),
-			"First request",
-		);
+		const saved = await store.create().startRequest("First request");
 
 		expect(saved.id).toBe("bbbbbbbbbbbb");
 		expect(await fs.readFile(collisionPath, "utf8")).toBe("occupied");
@@ -327,17 +303,17 @@ describe("createConversationStore", () => {
 			"2026-09-12T08:02:00.000Z",
 			"2026-09-12T08:03:00.000Z",
 		];
-		const store = await createConversationStore(root, {
+		const store = await ConversationStore.open(root, {
 			now: () => new Date(timestamps.shift() ?? "2026-09-12T09:00:00.000Z"),
 		});
-		const older = await store.startRequest(store.createConversation(), "Older");
-		const newer = await store.startRequest(store.createConversation(), "Newer");
+		const older = await store.create().startRequest("Older");
+		const newer = await store.create().startRequest("Newer");
 		await fs.writeFile(
 			path.join(root, "conversations", ".leftover.tmp"),
 			"partial",
 		);
 
-		const result = await store.listConversations();
+		const result = await store.list();
 
 		expect(result.invalidFileCount).toBe(0);
 		expect(result.conversations.map(({ id }) => id)).toEqual([
@@ -348,7 +324,7 @@ describe("createConversationStore", () => {
 
 	it("skips malformed, mismatched, unsupported, and invalid state files", async () => {
 		const { root, store } = await createStore();
-		const valid = await store.startRequest(store.createConversation(), "Valid");
+		const valid = await store.create().startRequest("Valid");
 		const directory = path.join(root, "conversations");
 		const invalidFiles = new Map([
 			["111111111111.json", "{"],
@@ -469,10 +445,10 @@ describe("createConversationStore", () => {
 			),
 		);
 
-		const result = await store.listConversations();
+		const result = await store.list();
 
 		expect(result).toEqual({
-			conversations: [valid],
+			conversations: [{ ...valid }],
 			invalidFileCount: 13,
 		});
 		for (const [filename, contents] of invalidFiles) {
@@ -490,16 +466,13 @@ describe("createConversationStore", () => {
 		const directory = path.join(root, "conversations");
 		await fs.mkdir(directory, { mode: 0o777 });
 		await fs.chmod(directory, 0o777);
-		const store = await createConversationStore(root);
-		const saved = await store.startRequest(
-			store.createConversation(),
-			"Sensitive request",
-		);
+		const store = await ConversationStore.open(root);
+		const saved = await store.create().startRequest("Sensitive request");
 		const statePath = path.join(directory, `${saved.id}.json`);
 		await fs.chmod(statePath, 0o666);
 
-		const reopenedStore = await createConversationStore(root);
-		await reopenedStore.loadConversation(saved.id);
+		const reopenedStore = await ConversationStore.open(root);
+		await reopenedStore.load(saved.id);
 
 		expect((await fs.stat(directory)).mode & 0o777).toBe(0o700);
 		expect((await fs.stat(statePath)).mode & 0o777).toBe(0o600);
@@ -516,7 +489,7 @@ describe("createConversationStore", () => {
 		await fs.chmod(external, 0o755);
 		await fs.symlink(external, path.join(root, "conversations"));
 
-		await expect(createConversationStore(root)).rejects.toThrow(
+		await expect(ConversationStore.open(root)).rejects.toThrow(
 			"Conversation storage path must be a directory",
 		);
 		expect((await fs.stat(external)).mode & 0o777).toBe(0o755);
@@ -524,10 +497,7 @@ describe("createConversationStore", () => {
 
 	it("rejects a conversation file symlink without changing its target", async () => {
 		const { root, store } = await createStore();
-		const saved = await store.startRequest(
-			store.createConversation(),
-			"Sensitive request",
-		);
+		const saved = await store.create().startRequest("Sensitive request");
 		const statePath = path.join(root, "conversations", `${saved.id}.json`);
 		const externalPath = path.join(root, "external.json");
 		const contents = await fs.readFile(statePath, "utf8");
@@ -536,10 +506,10 @@ describe("createConversationStore", () => {
 		await fs.chmod(externalPath, 0o644);
 		await fs.symlink(externalPath, statePath);
 
-		await expect(store.loadConversation(saved.id)).rejects.toThrow(
+		await expect(store.load(saved.id)).rejects.toThrow(
 			"Conversation state path must be a regular file",
 		);
-		expect(await store.listConversations()).toEqual({
+		expect(await store.list()).toEqual({
 			conversations: [],
 			invalidFileCount: 1,
 		});
@@ -551,27 +521,22 @@ describe("createConversationStore", () => {
 			path.join(os.tmpdir(), "micro-agent-conversations-"),
 		);
 		roots.push(root);
-		const store = await createConversationStore(root, {
+		const store = await ConversationStore.open(root, {
 			now: () => new Date("2026-09-12T08:00:00.000Z"),
 		});
-		const conversation = store.createConversation();
+		const conversation = store.create();
+		const created = conversation.updatedAt;
 
-		const pending = await store.startRequest(conversation, "Inspect");
-		const started = await store.markToolStarted(pending, {
-			callId: "call-1",
-			name: "read",
-		});
+		await conversation.startRequest("Inspect");
+		const pending = conversation.updatedAt;
+		await conversation.markToolStarted({ callId: "call-1", name: "read" });
 
-		expect([
-			conversation.updatedAt,
-			pending.updatedAt,
-			started.updatedAt,
-		]).toEqual([
+		expect([created, pending, conversation.updatedAt]).toEqual([
 			"2026-09-12T08:00:00.000Z",
 			"2026-09-12T08:00:00.001Z",
 			"2026-09-12T08:00:00.002Z",
 		]);
-		expect(pending.pendingRequest?.startedAt).toBe(pending.updatedAt);
+		expect(conversation.pendingRequest?.startedAt).toBe(pending);
 	});
 
 	it("rejects an invalid generated conversation ID", async () => {
@@ -579,21 +544,19 @@ describe("createConversationStore", () => {
 			path.join(os.tmpdir(), "micro-agent-conversations-"),
 		);
 		roots.push(root);
-		const store = await createConversationStore(root, {
+		const store = await ConversationStore.open(root, {
 			createId: () => "../outside",
 		});
 
-		expect(() => store.createConversation()).toThrow(
-			"Invalid generated conversation ID",
-		);
+		expect(() => store.create()).toThrow("Invalid generated conversation ID");
 	});
 
 	it("rejects a mutated conversation ID before writing", async () => {
 		const { root, store } = await createStore();
-		const conversation = store.createConversation();
+		const conversation = store.create();
 		conversation.id = "../outside";
 
-		await expect(store.startRequest(conversation, "Inspect")).rejects.toThrow(
+		await expect(conversation.startRequest("Inspect")).rejects.toThrow(
 			"Invalid conversation ID",
 		);
 		await expect(
@@ -605,14 +568,11 @@ describe("createConversationStore", () => {
 
 	it("counts an unreadable state file without changing its permissions", async () => {
 		const { root, store } = await createStore();
-		const saved = await store.startRequest(
-			store.createConversation(),
-			"Sensitive request",
-		);
+		const saved = await store.create().startRequest("Sensitive request");
 		const statePath = path.join(root, "conversations", `${saved.id}.json`);
 		await fs.chmod(statePath, 0o000);
 
-		const result = await store.listConversations();
+		const result = await store.list();
 
 		expect(result).toEqual({ conversations: [], invalidFileCount: 1 });
 		expect((await fs.stat(statePath)).mode & 0o777).toBe(0o000);
@@ -630,26 +590,23 @@ describe("createConversationStore", () => {
 
 	it("rejects invalid state before it can replace a valid checkpoint", async () => {
 		const { store } = await createStore();
-		const valid = await store.startRequest(
-			store.createConversation(),
-			"Valid request",
+		const conversation = store.create();
+		await conversation.startRequest("Valid request");
+		const saved = await store.load(conversation.id);
+		conversation.title = "";
+
+		await expect(conversation.commitCheckpoint([], "gpt-test")).rejects.toThrow(
+			"Invalid conversation state",
 		);
-		const invalid = { ...valid, title: "" };
 
-		await expect(
-			store.commitCheckpoint(invalid, [], "gpt-test"),
-		).rejects.toThrow("Invalid conversation state");
-
-		expect(await store.loadConversation(valid.id)).toEqual(valid);
+		expect(await store.load(conversation.id)).toEqual(saved);
 	});
 
 	it("loads a completed checkpoint when pendingRequest is absent", async () => {
 		const { root, store } = await createStore();
-		const committed = await store.commitCheckpoint(
-			await store.startRequest(store.createConversation(), "Complete"),
-			[],
-			"gpt-test",
-		);
+		const committed = store.create();
+		await committed.startRequest("Complete");
+		await committed.commitCheckpoint([], "gpt-test");
 		const statePath = path.join(root, "conversations", `${committed.id}.json`);
 		const withoutPending = JSON.parse(
 			await fs.readFile(statePath, "utf8"),
@@ -657,7 +614,7 @@ describe("createConversationStore", () => {
 		delete withoutPending.pendingRequest;
 		await fs.writeFile(statePath, JSON.stringify(withoutPending));
 
-		const loaded = await store.loadConversation(committed.id);
+		const loaded = await store.load(committed.id);
 
 		expect(loaded.pendingRequest).toBeNull();
 		expect(loaded.input).toEqual([]);

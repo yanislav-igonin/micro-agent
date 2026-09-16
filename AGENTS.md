@@ -15,10 +15,10 @@ This repository is a small TypeScript command-line coding agent built on the Ope
 Agent core (`src/`):
 
 - `src/index.ts`: entry point. Loads dotenv, creates the journal and the conversation store, then runs the prompt loop in `src/cli.ts`. `--no-log` disables journaling; Ctrl-C exits with code 130.
-- `src/cli.ts`: the interactive loop. Prompt formatting with live context usage, `/history` and `/new`, `exit`/`quit`, checkpoint save and retry, SIGINT handling, and the `WARNING:` / `UNSAVED:` messages.
-- `src/agent.ts`: model and tool loop, limited to 20 model steps per user request. Owns system instructions, exact input-token preflight, the context-budget boundary and compaction, tool-call execution, and the stop reason. Exports `createAgent`.
+- `src/cli.ts`: the interactive loop. Exports `runCli` (the injectable entry point used by tests) and the `Cli` class that holds one run: prompt formatting with live context usage, `/history` and `/new`, `exit`/`quit`, checkpoint save and retry, SIGINT handling, and the `WARNING:` / `UNSAVED:` messages.
+- `src/agent.ts`: model and tool loop, limited to 20 model steps per user request. Owns system instructions, exact input-token preflight, the context-budget boundary and compaction, tool-call execution, and the stop reason. Exports the `Agent` class; one instance continues one conversation and keeps the last complete model input.
 - `src/tools.ts`: tool schemas and dispatch for `read`, `write`, `edit`, `replace`, and `run`, plus the bounded model-visible output representation.
-- `src/conversations.ts`: durable checkpoint store. Reads and writes `conversations/<12-hex-id>.json` atomically.
+- `src/conversations.ts`: durable checkpoint store, split into two classes. `Conversation` is one conversation's state plus the mutations the agent loop applies to it; `ConversationStore` owns the filesystem operations that create, list, load, and save `conversations/<12-hex-id>.json` atomically. A mutation adopts its new revision only after the write succeeded.
 - `src/journal.ts`: append-only JSONL diagnostic journal at `logs/<UTC-timestamp>-<pid>.jsonl`. Serializes each event eagerly, before the next model or tool step can mutate it.
 
 Journal viewer (`viewer/`, wired by `vite.config.ts`):
@@ -65,6 +65,7 @@ This is a learning project. The user should be able to read the code and underst
 - Keep one concern per module: CLI interaction in `src/cli.ts`, the model/tool loop in `src/agent.ts`, tool schemas and execution in `src/tools.ts`, persistence in `src/conversations.ts`, diagnostics in `src/journal.ts`. This split is a readability reference, not a hard limit; add a module only when it makes behavior easier to understand.
 - Keep the core sequence easy to follow in one place: build model input, call the model, inspect its response, execute tools, append results, and repeat or stop. Do not hide these steps behind generic orchestration layers.
 - Prefer ordinary functions, explicit loops, conditionals, and a direct tool-dispatch switch. Avoid factories, service layers, registries, event buses, dependency-injection containers, and class hierarchies unless a concrete requirement makes them simpler overall.
+- The three core entities are deliberately plain classes: `Agent`, `Conversation` with `ConversationStore`, and `Cli`. Each one holds state that was previously threaded through closures and long parameter lists, and each was introduced for that concrete reason. Keep them flat: no inheritance, no interface that exists only for another class to implement, and no factory beyond `ConversationStore.open`. A struct that names the arguments of one call (`AgentRunOptions`, `CliOptions`, `ConversationStoreOptions`) is not such an interface and is welcome.
 - Extend existing modules first. Do not create a file per small function, tool, event, or type.
 - A little straightforward duplication is preferable to an abstraction that forces the reader to jump between files or learn a framework. Extract helpers for meaningful concepts or real repetition, not merely to shorten a function.
 - Use clear names and simple types. Avoid clever generic types, compressed expressions, and speculative extension points. Simplicity does not justify bypassing type checks or omitting necessary validation and error handling.

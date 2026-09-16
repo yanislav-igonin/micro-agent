@@ -229,48 +229,289 @@ interface ConversationStoreOptions {
 	now?: () => Date;
 }
 
-export async function createConversationStore(
-	root = process.cwd(),
-	options: ConversationStoreOptions = {},
-) {
-	const directory = path.join(root, "conversations");
-	const createId = options.createId ?? (() => randomBytes(6).toString("hex"));
-	const now = options.now ?? (() => new Date());
-	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-	if (!(await fs.lstat(directory)).isDirectory()) {
-		throw new Error("Conversation storage path must be a directory");
-	}
-	// mkdir's mode does not tighten an already existing directory.
-	await fs.chmod(directory, 0o700);
+/**
+ * One conversation: the input the model sees, the request still in flight, and
+ * the mutations the agent loop applies to them.
+ *
+ * The store reference is a #private field, so a conversation serializes as
+ * exactly the state that is written to disk.
+ */
+export class Conversation {
+	readonly schemaVersion = 1;
+	id: string;
+	title: string;
+	createdAt: string;
+	updatedAt: string;
+	revision: number;
+	lastModel: string | null;
+	input: ResponseInput;
+	pendingRequest: PendingRequest | null;
+	#store: ConversationStore;
 
-	function generateId() {
-		const id = createId();
+	constructor(store: ConversationStore, state: ConversationState) {
+		this.#store = store;
+		this.id = state.id;
+		this.title = state.title;
+		this.createdAt = state.createdAt;
+		this.updatedAt = state.updatedAt;
+		this.revision = state.revision;
+		this.lastModel = state.lastModel;
+		this.input = state.input;
+		this.pendingRequest = state.pendingRequest;
+	}
+
+	/** The tool that started but never finished; it blocks compaction and steps. */
+	blockingTool() {
+		return this.pendingRequest?.tools.find((tool) => tool.status === "started");
+	}
+
+	/** Records the user request before any model work for it starts. */
+	async startRequest(prompt: string) {
+		const timestamp = this.#store.timestampAfter(this.updatedAt);
+		return this.#save(
+			{
+				title: this.title || createTitle(prompt),
+				pendingRequest: {
+					prompt,
+					startedAt: timestamp,
+					tools: [],
+				},
+			},
+			timestamp,
+		);
+	}
+
+	async markToolStarted(tool: Omit<PendingTool, "status">) {
+		const pending = this.#requirePendingRequest();
+		return this.#save({
+			pendingRequest: {
+				...pending,
+				tools: [...pending.tools, { ...tool, status: "started" }],
+			},
+		});
+	}
+
+	async markToolFinished(callId: string) {
+		const pending = this.#requirePendingRequest();
+		if (!pending.tools.some((candidate) => candidate.callId === callId)) {
+			throw new Error(`Pending tool not found: ${callId}`);
+		}
+		return this.#save({
+			pendingRequest: {
+				...pending,
+				tools: pending.tools.map((candidate) =>
+					candidate.callId === callId
+						? { ...candidate, status: "finished" }
+						: candidate,
+				),
+			},
+		});
+	}
+
+	/** Replaces the checkpoint with the complete input of a finished request. */
+	async commitCheckpoint(input: ResponseInput, lastModel: string | null) {
+		return this.#save({
+			input: structuredClone(input),
+			lastModel,
+			pendingRequest: null,
+		});
+	}
+
+	/** Replaces older input with a compacted window without ending the request. */
+	async saveCompactionCheckpoint(input: ResponseInput, lastModel: string) {
+		this.#requirePendingRequest();
+		if (this.blockingTool()) throw new Error("Started tool blocks compaction");
+		return this.#save({ input: structuredClone(input), lastModel });
+	}
+
+	#requirePendingRequest() {
+		if (!this.pendingRequest) {
+			throw new Error("Conversation has no pending request");
+		}
+		return this.pendingRequest;
+	}
+
+	/**
+	 * Writes the next revision and only then adopts it, so a failed save leaves
+	 * this conversation exactly as the saved file still describes it.
+	 */
+	async #save(changes: Partial<ConversationState>, updatedAt?: string) {
+		const next: ConversationState = {
+			...this.#snapshot(),
+			...changes,
+			updatedAt: updatedAt ?? this.#store.timestampAfter(this.updatedAt),
+			revision: this.revision + 1,
+		};
+		Object.assign(this, await this.#store.save(next, this.revision));
+		return this;
+	}
+
+	#snapshot(): ConversationState {
+		return {
+			schemaVersion: 1,
+			id: this.id,
+			title: this.title,
+			createdAt: this.createdAt,
+			updatedAt: this.updatedAt,
+			revision: this.revision,
+			lastModel: this.lastModel,
+			input: this.input,
+			pendingRequest: this.pendingRequest,
+		};
+	}
+}
+
+/**
+ * Local conversation files: the operations that create, list, load, and persist
+ * them. It never runs the agent or executes tools.
+ */
+export class ConversationStore {
+	#directory: string;
+	#createId: () => string;
+	#now: () => Date;
+
+	private constructor(root: string, options: ConversationStoreOptions) {
+		this.#directory = path.join(root, "conversations");
+		this.#createId = options.createId ?? (() => randomBytes(6).toString("hex"));
+		this.#now = options.now ?? (() => new Date());
+	}
+
+	/** Opens storage, creating the directory when it is missing. */
+	static async open(
+		root = process.cwd(),
+		options: ConversationStoreOptions = {},
+	) {
+		const store = new ConversationStore(root, options);
+		await store.#prepareDirectory();
+		return store;
+	}
+
+	create(): Conversation {
+		const timestamp = this.#now().toISOString();
+		return new Conversation(this, {
+			schemaVersion: 1,
+			id: this.#generateId(),
+			title: "",
+			createdAt: timestamp,
+			updatedAt: timestamp,
+			revision: 0,
+			lastModel: null,
+			input: [],
+			pendingRequest: null,
+		});
+	}
+
+	/** Reads one saved state; the caller decides whether to adopt it. */
+	async load(id: string): Promise<ConversationState> {
+		if (!ID_PATTERN.test(id)) {
+			throw new Error(`Invalid conversation ID: ${id}`);
+		}
+		const statePath = path.join(this.#directory, `${id}.json`);
+		return await this.#readStateFile(statePath, id);
+	}
+
+	async list() {
+		const conversations: ConversationState[] = [];
+		let invalidFileCount = 0;
+		for (const entry of await fs.readdir(this.#directory, {
+			withFileTypes: true,
+		})) {
+			const filename = entry.name;
+			if (!filename.endsWith(".json")) continue;
+			try {
+				if (!entry.isFile()) {
+					throw new Error("Conversation state path must be a regular file");
+				}
+				const id = filename.slice(0, -".json".length);
+				const statePath = path.join(this.#directory, filename);
+				conversations.push(await this.#readStateFile(statePath, id));
+			} catch {
+				invalidFileCount++;
+			}
+		}
+		conversations.sort((left, right) =>
+			right.updatedAt.localeCompare(left.updatedAt),
+		);
+		return { conversations, invalidFileCount };
+	}
+
+	/** Next ISO timestamp strictly after `previous`. */
+	timestampAfter(previous: string) {
+		const currentTime = this.#now().valueOf();
+		const previousTime = new Date(previous).valueOf();
+		return new Date(Math.max(currentTime, previousTime + 1)).toISOString();
+	}
+
+	/**
+	 * Low-level write of one revision, used only by `Conversation#save`. Calling
+	 * it directly would bypass the conversation's own invariants.
+	 */
+	async save(
+		state: ConversationState,
+		expectedRevision: number,
+	): Promise<ConversationState> {
+		if (!ID_PATTERN.test(state.id)) {
+			throw new Error(`Invalid conversation ID: ${state.id}`);
+		}
+
+		if (expectedRevision > 0) {
+			const targetPath = path.join(this.#directory, `${state.id}.json`);
+			const current = await this.#readStateFile(targetPath, state.id);
+			if (current.revision !== expectedRevision) {
+				throw new Error(
+					`Conversation revision mismatch: expected ${expectedRevision}, found ${current.revision}`,
+				);
+			}
+			const temporaryPath = await this.#writeTemporaryState(state);
+			try {
+				await fs.rename(temporaryPath, targetPath);
+				return state;
+			} finally {
+				await this.#removeTemporaryFile(temporaryPath);
+			}
+		}
+
+		let stateToWrite = state;
+		while (true) {
+			const firstPath = path.join(this.#directory, `${stateToWrite.id}.json`);
+			const temporaryPath = await this.#writeTemporaryState(stateToWrite);
+			try {
+				try {
+					// A hard link publishes the complete first state without an empty target.
+					await fs.link(temporaryPath, firstPath);
+					return stateToWrite;
+				} catch (error) {
+					if (!hasErrorCode(error, "EEXIST")) throw error;
+					stateToWrite = { ...stateToWrite, id: this.#generateId() };
+				}
+			} finally {
+				await this.#removeTemporaryFile(temporaryPath);
+			}
+		}
+	}
+
+	async #prepareDirectory() {
+		await fs.mkdir(this.#directory, { recursive: true, mode: 0o700 });
+		if (!(await fs.lstat(this.#directory)).isDirectory()) {
+			throw new Error("Conversation storage path must be a directory");
+		}
+		// mkdir's mode does not tighten an already existing directory.
+		await fs.chmod(this.#directory, 0o700);
+	}
+
+	#generateId() {
+		const id = this.#createId();
 		if (!ID_PATTERN.test(id)) {
 			throw new Error("Invalid generated conversation ID");
 		}
 		return id;
 	}
 
-	function nextTimestamp(previous: string) {
-		const currentTime = now().valueOf();
-		const previousTime = new Date(previous).valueOf();
-		return new Date(Math.max(currentTime, previousTime + 1)).toISOString();
-	}
-
-	function hasErrorCode(error: unknown, code: string) {
-		return (
-			typeof error === "object" &&
-			error !== null &&
-			"code" in error &&
-			error.code === code
-		);
-	}
-
-	async function writeTemporaryState(state: ConversationState) {
+	async #writeTemporaryState(state: ConversationState) {
 		const serializedState = `${JSON.stringify(state, null, 2)}\n`;
 		parseState(serializedState, state.id);
 		const temporaryPath = path.join(
-			directory,
+			this.#directory,
 			`.${state.id}.${randomBytes(6).toString("hex")}.tmp`,
 		);
 		await fs.writeFile(temporaryPath, serializedState, {
@@ -280,7 +521,7 @@ export async function createConversationStore(
 		return temporaryPath;
 	}
 
-	async function removeTemporaryFile(temporaryPath: string) {
+	async #removeTemporaryFile(temporaryPath: string) {
 		try {
 			await fs.rm(temporaryPath, { force: true });
 		} catch {
@@ -288,7 +529,7 @@ export async function createConversationStore(
 		}
 	}
 
-	async function readStateFile(statePath: string, expectedId: string) {
+	async #readStateFile(statePath: string, expectedId: string) {
 		if (!(await fs.lstat(statePath)).isFile()) {
 			throw new Error("Conversation state path must be a regular file");
 		}
@@ -308,195 +549,13 @@ export async function createConversationStore(
 			await handle.close();
 		}
 	}
-
-	async function writeState(
-		state: ConversationState,
-		expectedRevision: number,
-	) {
-		if (!ID_PATTERN.test(state.id)) {
-			throw new Error(`Invalid conversation ID: ${state.id}`);
-		}
-		if (expectedRevision > 0) {
-			const targetPath = path.join(directory, `${state.id}.json`);
-			const current = await readStateFile(targetPath, state.id);
-			if (current.revision !== expectedRevision) {
-				throw new Error(
-					`Conversation revision mismatch: expected ${expectedRevision}, found ${current.revision}`,
-				);
-			}
-			const temporaryPath = await writeTemporaryState(state);
-			try {
-				await fs.rename(temporaryPath, targetPath);
-				return state;
-			} finally {
-				await removeTemporaryFile(temporaryPath);
-			}
-		}
-
-		let stateToWrite = state;
-		while (true) {
-			const targetPath = path.join(directory, `${stateToWrite.id}.json`);
-			const temporaryPath = await writeTemporaryState(stateToWrite);
-			try {
-				try {
-					// A hard link publishes the complete first state without an empty target.
-					await fs.link(temporaryPath, targetPath);
-					return stateToWrite;
-				} catch (error) {
-					if (!hasErrorCode(error, "EEXIST")) throw error;
-					stateToWrite = { ...stateToWrite, id: generateId() };
-				}
-			} finally {
-				await removeTemporaryFile(temporaryPath);
-			}
-		}
-	}
-
-	async function saveMutation(
-		conversation: ConversationState,
-		changes: Partial<ConversationState>,
-		timestamp = nextTimestamp(conversation.updatedAt),
-	) {
-		const next = {
-			...conversation,
-			...changes,
-			updatedAt: timestamp,
-			revision: conversation.revision + 1,
-		} satisfies ConversationState;
-		return writeState(next, conversation.revision);
-	}
-
-	return {
-		createConversation(): ConversationState {
-			const timestamp = now().toISOString();
-			return {
-				schemaVersion: 1,
-				id: generateId(),
-				title: "",
-				createdAt: timestamp,
-				updatedAt: timestamp,
-				revision: 0,
-				lastModel: null,
-				input: [],
-				pendingRequest: null,
-			};
-		},
-		async startRequest(conversation: ConversationState, prompt: string) {
-			const timestamp = nextTimestamp(conversation.updatedAt);
-			return saveMutation(
-				conversation,
-				{
-					title: conversation.title || createTitle(prompt),
-					pendingRequest: {
-						prompt,
-						startedAt: timestamp,
-						tools: [],
-					},
-				},
-				timestamp,
-			);
-		},
-		async markToolStarted(
-			conversation: ConversationState,
-			tool: Omit<PendingTool, "status">,
-		) {
-			if (!conversation.pendingRequest) {
-				throw new Error("Conversation has no pending request");
-			}
-			return saveMutation(conversation, {
-				pendingRequest: {
-					...conversation.pendingRequest,
-					tools: [
-						...conversation.pendingRequest.tools,
-						{ ...tool, status: "started" },
-					],
-				},
-			});
-		},
-		async markToolFinished(conversation: ConversationState, callId: string) {
-			if (!conversation.pendingRequest) {
-				throw new Error("Conversation has no pending request");
-			}
-			const tool = conversation.pendingRequest.tools.find(
-				(candidate) => candidate.callId === callId,
-			);
-			if (!tool) {
-				throw new Error(`Pending tool not found: ${callId}`);
-			}
-			return saveMutation(conversation, {
-				pendingRequest: {
-					...conversation.pendingRequest,
-					tools: conversation.pendingRequest.tools.map((candidate) =>
-						candidate.callId === callId
-							? { ...candidate, status: "finished" }
-							: candidate,
-					),
-				},
-			});
-		},
-		async commitCheckpoint(
-			conversation: ConversationState,
-			input: ResponseInput,
-			lastModel: string | null,
-		) {
-			return saveMutation(conversation, {
-				input: structuredClone(input),
-				lastModel,
-				pendingRequest: null,
-			});
-		},
-		async saveCompactionCheckpoint(
-			conversation: ConversationState,
-			input: ResponseInput,
-			lastModel: string,
-		) {
-			if (!conversation.pendingRequest)
-				throw new Error("Conversation has no pending request");
-			if (
-				conversation.pendingRequest.tools.some(
-					(tool) => tool.status === "started",
-				)
-			)
-				throw new Error("Started tool blocks compaction");
-			return saveMutation(conversation, {
-				input: structuredClone(input),
-				lastModel,
-			});
-		},
-		async loadConversation(id: string) {
-			if (!ID_PATTERN.test(id)) {
-				throw new Error(`Invalid conversation ID: ${id}`);
-			}
-			const statePath = path.join(directory, `${id}.json`);
-			return readStateFile(statePath, id);
-		},
-		async listConversations() {
-			const conversations: ConversationState[] = [];
-			let invalidFileCount = 0;
-			for (const entry of await fs.readdir(directory, {
-				withFileTypes: true,
-			})) {
-				const filename = entry.name;
-				if (!filename.endsWith(".json")) continue;
-				try {
-					if (!entry.isFile()) {
-						throw new Error("Conversation state path must be a regular file");
-					}
-					const id = filename.slice(0, -".json".length);
-					const statePath = path.join(directory, filename);
-					conversations.push(await readStateFile(statePath, id));
-				} catch {
-					invalidFileCount++;
-				}
-			}
-			conversations.sort((left, right) =>
-				right.updatedAt.localeCompare(left.updatedAt),
-			);
-			return { conversations, invalidFileCount };
-		},
-	};
 }
 
-export type ConversationStore = Awaited<
-	ReturnType<typeof createConversationStore>
->;
+function hasErrorCode(error: unknown, code: string) {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		error.code === code
+	);
+}

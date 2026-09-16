@@ -5,10 +5,10 @@ import path from "node:path";
 import type { ResponseInput } from "openai/resources/responses/responses";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { AgentRunOptions } from "./agent.js";
+import type { Agent, AgentResult, AgentRunOptions } from "./agent.js";
 import { ContextBudgetExceededError, UnsavedCompactionError } from "./agent.js";
 import { formatAgentPrompt, parseContextBudget, runCli } from "./cli.js";
-import { createConversationStore } from "./conversations.js";
+import { ConversationStore } from "./conversations.js";
 import { createJournal, type Journal } from "./journal.js";
 
 const roots: string[] = [];
@@ -29,6 +29,16 @@ function journalWith(
 	} as unknown as Journal;
 }
 
+type AgentRunner = (
+	prompt: string,
+	options: AgentRunOptions,
+) => Promise<AgentResult>;
+
+/** Stands in for a real Agent where the CLI only needs its run method. */
+function fakeAgent(run: AgentRunner) {
+	return { run } as Agent;
+}
+
 function promptWith(answers: string[]) {
 	return Object.assign(new EventEmitter(), {
 		question: vi.fn(async (_query: string) => answers.shift() ?? "quit"),
@@ -41,10 +51,10 @@ function promptWith(answers: string[]) {
 async function createStore() {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "micro-agent-cli-"));
 	roots.push(root);
-	return { root, store: await createConversationStore(root) };
+	return { root, store: await ConversationStore.open(root) };
 }
 
-function successfulAgentFactory(initialInput: ResponseInput = []) {
+function successfulAgentRunner(initialInput: ResponseInput = []): AgentRunner {
 	let checkpoint = structuredClone(initialInput);
 	return async (prompt: string) => {
 		checkpoint = [...checkpoint, { role: "user", content: prompt }];
@@ -54,6 +64,10 @@ function successfulAgentFactory(initialInput: ResponseInput = []) {
 			model: "test-model",
 		};
 	};
+}
+
+function successfulAgentFactory(initialInput: ResponseInput = []) {
+	return fakeAgent(successfulAgentRunner(initialInput));
 }
 
 beforeEach(() => {
@@ -80,20 +94,17 @@ describe("runCli", () => {
 			{ type: "compaction", id: "cmp-marker", encrypted_content: "opaque" },
 		];
 		let runs = 0;
-		const agent = async (
-			userPrompt: string,
-			_journal: Journal,
-			_number: number,
-			options: AgentRunOptions = {},
-		) => {
-			runs++;
-			if (runs === 1) await options.onCompacted?.(compacted, "test-model");
-			return {
-				answer: "done",
-				input: [...compacted, { role: "user" as const, content: userPrompt }],
-				model: "test-model",
-			};
-		};
+		const agent = fakeAgent(
+			async (userPrompt: string, options: AgentRunOptions) => {
+				runs++;
+				if (runs === 1) await options.onCompacted?.(compacted, "test-model");
+				return {
+					answer: "done",
+					input: [...compacted, { role: "user" as const, content: userPrompt }],
+					model: "test-model",
+				};
+			},
+		);
 		await runCli(prompt, journalWith(), store, () => agent, new EventEmitter());
 		expect(prompt.question.mock.calls.map(([label]) => label)).toEqual([
 			"agent> ",
@@ -106,14 +117,9 @@ describe("runCli", () => {
 		const compacted: ResponseInput = [
 			{ type: "compaction", id: "cmp-old", encrypted_content: "opaque" },
 		];
-		const saved = await store.saveCompactionCheckpoint(
-			await store.startRequest(
-				store.createConversation(),
-				"unfinished old work",
-			),
-			compacted,
-			"test-model",
-		);
+		const saved = store.create();
+		await saved.startRequest("unfinished old work");
+		await saved.saveCompactionCheckpoint(compacted, "test-model");
 		const createAgent = vi.fn(successfulAgentFactory);
 		await runCli(
 			promptWith(["/history", "later request", "quit"]),
@@ -127,7 +133,7 @@ describe("runCli", () => {
 			[],
 			compacted,
 		]);
-		expect((await store.loadConversation(saved.id)).input).toEqual([
+		expect((await store.load(saved.id)).input).toEqual([
 			...compacted,
 			{ role: "user", content: "later request" },
 		]);
@@ -141,49 +147,44 @@ describe("runCli", () => {
 			{ type: "compaction", id: "cmp-1", encrypted_content: "opaque" },
 		];
 		let saves = 0;
-		const flakyStore = {
-			...store,
-			saveCompactionCheckpoint: async (
-				...args: Parameters<typeof store.saveCompactionCheckpoint>
-			) => {
-				saves++;
-				if (saves < 3) throw new Error("disk full");
-				return store.saveCompactionCheckpoint(...args);
-			},
-		};
-		const agent = vi.fn(
-			async (
-				_prompt: string,
-				_journal: Journal,
-				_number: number,
-				options: AgentRunOptions = {},
-			) => {
-				try {
-					await options.onCompacted?.(compacted, "test-model");
-				} catch {
-					throw new UnsavedCompactionError(
-						compacted,
-						"test-model",
-						new Error("disk full"),
-					);
+		const save = store.save.bind(store);
+		vi.spyOn(store, "save").mockImplementation(
+			async (state, expectedRevision) => {
+				// Compaction keeps the pending request; a commit clears it.
+				if (state.pendingRequest && expectedRevision > 0) {
+					saves++;
+					if (saves < 3) throw new Error("disk full");
 				}
-				throw new Error("unexpected continuation");
+				return save(state, expectedRevision);
 			},
 		);
+		const run = vi.fn(async (_prompt: string, options: AgentRunOptions) => {
+			try {
+				await options.onCompacted?.(compacted, "test-model");
+			} catch {
+				throw new UnsavedCompactionError(
+					compacted,
+					"test-model",
+					new Error("disk full"),
+				);
+			}
+			throw new Error("unexpected continuation");
+		});
+		const agent = fakeAgent(run);
 		const selector = vi.fn();
 		const prompt = promptWith(["first", "/new", "/history", "quit"]);
 		await runCli(
 			prompt,
 			journalWith(),
-			flakyStore,
+			store,
 			() => agent,
 			new EventEmitter(),
 			selector,
 		);
-		expect(agent).toHaveBeenCalledOnce();
+		expect(run).toHaveBeenCalledOnce();
 		expect(selector).not.toHaveBeenCalled();
 		expect(saves).toBe(3);
-		const { conversations } = await store.listConversations();
+		const { conversations } = await store.list();
 		expect(conversations).toHaveLength(1);
 		expect(conversations[0]?.input).toEqual(compacted);
 		expect(conversations[0]?.pendingRequest?.prompt).toBe("first");
@@ -197,19 +198,16 @@ describe("runCli", () => {
 	it("shows the latest exact usage in the next prompt", async () => {
 		const { store } = await createStore();
 		const prompt = promptWith(["first", "quit"]);
-		const agent = async (
-			userPrompt: string,
-			_journal: Journal,
-			_requestNumber: number,
-			options: AgentRunOptions = {},
-		) => {
-			options.onContextMeasured?.(42_103);
-			return {
-				answer: "done",
-				input: [{ role: "user" as const, content: userPrompt }],
-				model: "test-model",
-			};
-		};
+		const agent = fakeAgent(
+			async (userPrompt: string, options: AgentRunOptions) => {
+				options.onContextMeasured?.(42_103);
+				return {
+					answer: "done",
+					input: [{ role: "user" as const, content: userPrompt }],
+					model: "test-model",
+				};
+			},
+		);
 		await runCli(prompt, journalWith(), store, () => agent, new EventEmitter());
 		expect(prompt.question.mock.calls.map(([label]) => label)).toEqual([
 			"agent> ",
@@ -220,19 +218,16 @@ describe("runCli", () => {
 	it("shows the budget percentage after exact measurement", async () => {
 		const { store } = await createStore();
 		const prompt = promptWith(["first", "quit"]);
-		const agent = async (
-			userPrompt: string,
-			_journal: Journal,
-			_requestNumber: number,
-			options: AgentRunOptions = {},
-		) => {
-			options.onContextMeasured?.(42_103);
-			return {
-				answer: "done",
-				input: [{ role: "user" as const, content: userPrompt }],
-				model: "test-model",
-			};
-		};
+		const agent = fakeAgent(
+			async (userPrompt: string, options: AgentRunOptions) => {
+				options.onContextMeasured?.(42_103);
+				return {
+					answer: "done",
+					input: [{ role: "user" as const, content: userPrompt }],
+					model: "test-model",
+				};
+			},
+		);
 		await runCli(
 			prompt,
 			journalWith(),
@@ -251,13 +246,8 @@ describe("runCli", () => {
 
 	it("reports a hard budget block and retains incomplete request metadata", async () => {
 		const { store } = await createStore();
-		const agent = vi.fn(
-			async (
-				_prompt: string,
-				_journal: Journal,
-				_requestNumber: number,
-				options: AgentRunOptions = {},
-			) => {
+		const agent = fakeAgent(
+			async (_prompt: string, options: AgentRunOptions) => {
 				options.onContextMeasured?.(101);
 				options.onContextWarning?.(101, 100);
 				throw new ContextBudgetExceededError(101, 100);
@@ -277,7 +267,7 @@ describe("runCli", () => {
 			expect.stringContaining("Context Budget exceeded"),
 		);
 		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("80%"));
-		expect((await store.listConversations()).conversations[0]).toMatchObject({
+		expect((await store.list()).conversations[0]).toMatchObject({
 			input: [],
 			pendingRequest: { prompt: "blocked", tools: [] },
 		});
@@ -285,8 +275,9 @@ describe("runCli", () => {
 
 	it("cancels history without replacing the active conversation", async () => {
 		const { store } = await createStore();
-		await store.commitCheckpoint(
-			await store.startRequest(store.createConversation(), "saved request"),
+		const savedConversation = store.create();
+		await savedConversation.startRequest("saved request");
+		await savedConversation.commitCheckpoint(
 			[{ role: "user", content: "saved request" }],
 			"test-model",
 		);
@@ -302,7 +293,7 @@ describe("runCli", () => {
 		);
 
 		expect(createAgent).toHaveBeenCalledOnce();
-		const { conversations } = await store.listConversations();
+		const { conversations } = await store.list();
 		expect(conversations).toHaveLength(2);
 		expect(conversations).toContainEqual(
 			expect.objectContaining({
@@ -338,17 +329,25 @@ describe("runCli", () => {
 
 	it("blocks history and new while the completed checkpoint is unsaved", async () => {
 		const { store } = await createStore();
-		const failingStore = {
-			...store,
-			commitCheckpoint: vi.fn().mockRejectedValue(new Error("disk full")),
-		};
+		const save = store.save.bind(store);
+		let commitAttempts = 0;
+		vi.spyOn(store, "save").mockImplementation(
+			async (state, expectedRevision) => {
+				// A commit clears the pending request; compaction keeps it.
+				if (state.pendingRequest === null && expectedRevision > 0) {
+					commitAttempts++;
+					throw new Error("disk full");
+				}
+				return save(state, expectedRevision);
+			},
+		);
 		const createAgent = vi.fn(successfulAgentFactory);
 		const selectConversation = vi.fn();
 
 		await runCli(
 			promptWith(["first request", "/history", "/new", "quit"]),
 			journalWith(),
-			failingStore,
+			store,
 			createAgent,
 			new EventEmitter(),
 			selectConversation,
@@ -356,23 +355,19 @@ describe("runCli", () => {
 
 		expect(selectConversation).not.toHaveBeenCalled();
 		expect(createAgent).toHaveBeenCalledOnce();
-		expect(failingStore.commitCheckpoint).toHaveBeenCalledTimes(3);
+		expect(commitAttempts).toBe(3);
 	});
 
 	it("supports switching conversations more than once in one run", async () => {
 		const { store } = await createStore();
 		const firstInput = [{ role: "user" as const, content: "first saved" }];
 		const secondInput = [{ role: "user" as const, content: "second saved" }];
-		const first = await store.commitCheckpoint(
-			await store.startRequest(store.createConversation(), "first saved"),
-			firstInput,
-			"test-model",
-		);
-		const second = await store.commitCheckpoint(
-			await store.startRequest(store.createConversation(), "second saved"),
-			secondInput,
-			"test-model",
-		);
+		const first = store.create();
+		await first.startRequest("first saved");
+		await first.commitCheckpoint(firstInput, "test-model");
+		const second = store.create();
+		await second.startRequest("second saved");
+		await second.commitCheckpoint(secondInput, "test-model");
 		const selections = [first.id, second.id];
 		const createAgent = vi.fn(successfulAgentFactory);
 
@@ -390,7 +385,7 @@ describe("runCli", () => {
 			firstInput,
 			secondInput,
 		]);
-		expect((await store.loadConversation(second.id)).input).toEqual([
+		expect((await store.load(second.id)).input).toEqual([
 			...secondInput,
 			{ role: "user", content: "continued" },
 		]);
@@ -399,11 +394,9 @@ describe("runCli", () => {
 	it("uses the interactive selector when no test selector is injected", async () => {
 		const { store } = await createStore();
 		const savedInput = [{ role: "user" as const, content: "saved request" }];
-		const saved = await store.commitCheckpoint(
-			await store.startRequest(store.createConversation(), "saved request"),
-			savedInput,
-			"test-model",
-		);
+		const saved = store.create();
+		await saved.startRequest("saved request");
+		await saved.commitCheckpoint(savedInput, "test-model");
 		clack.select.mockResolvedValue(saved.id);
 		const createAgent = vi.fn(successfulAgentFactory);
 
@@ -433,21 +426,14 @@ describe("runCli", () => {
 	it("shows recovery warnings and blocks model work while a restored tool is started", async () => {
 		const { store } = await createStore();
 		const stableInput = [{ role: "user" as const, content: "stable request" }];
-		const completed = await store.commitCheckpoint(
-			await store.startRequest(store.createConversation(), "stable request"),
-			stableInput,
-			"old-model",
-		);
-		const pending = await store.markToolFinished(
-			await store.markToolStarted(
-				await store.markToolStarted(
-					await store.startRequest(completed, "unfinished request"),
-					{ callId: "call-started", name: "write" },
-				),
-				{ callId: "call-finished", name: "read" },
-			),
-			"call-finished",
-		);
+		const completed = store.create();
+		await completed.startRequest("stable request");
+		await completed.commitCheckpoint(stableInput, "old-model");
+		await completed.startRequest("unfinished request");
+		await completed.markToolStarted({ callId: "call-started", name: "write" });
+		await completed.markToolStarted({ callId: "call-finished", name: "read" });
+		await completed.markToolFinished("call-finished");
+		const pending = completed;
 		const createAgent = vi.fn(successfulAgentFactory);
 
 		await runCli(
@@ -479,22 +465,21 @@ describe("runCli", () => {
 		expect(console.error).toHaveBeenCalledWith(
 			"WARNING: a started tool blocks the next model call.",
 		);
-		expect((await store.loadConversation(pending.id)).input).toEqual(
-			stableInput,
+		expect((await store.load(pending.id)).input).toEqual(stableInput);
+		expect((await store.load(pending.id)).pendingRequest?.tools).toContainEqual(
+			{
+				callId: "call-started",
+				name: "write",
+				status: "started",
+			},
 		);
-		expect(
-			(await store.loadConversation(pending.id)).pendingRequest?.tools,
-		).toContainEqual({
-			callId: "call-started",
-			name: "write",
-			status: "started",
-		});
 	});
 
 	it("keeps the active conversation when the selected file changes before loading", async () => {
 		const { root, store } = await createStore();
-		const target = await store.commitCheckpoint(
-			await store.startRequest(store.createConversation(), "target request"),
+		const target = store.create();
+		await target.startRequest("target request");
+		await target.commitCheckpoint(
 			[{ role: "user", content: "target request" }],
 			"old-model",
 		);
@@ -517,7 +502,7 @@ describe("runCli", () => {
 		);
 
 		expect(createAgent).toHaveBeenCalledOnce();
-		const { conversations } = await store.listConversations();
+		const { conversations } = await store.list();
 		expect(conversations).toHaveLength(1);
 		expect(conversations.at(0)?.input).toEqual([
 			{ role: "user", content: "current request" },
@@ -530,14 +515,15 @@ describe("runCli", () => {
 
 	it("keeps the active conversation when the selected file changes to another valid state", async () => {
 		const { store } = await createStore();
-		let target = await store.commitCheckpoint(
-			await store.startRequest(store.createConversation(), "target request"),
+		const target = store.create();
+		await target.startRequest("target request");
+		await target.commitCheckpoint(
 			[{ role: "user", content: "target request" }],
 			"old-model",
 		);
 		const createAgent = vi.fn(successfulAgentFactory);
 		const selectConversation = vi.fn(async () => {
-			target = await store.startRequest(target, "changed after listing");
+			await target.startRequest("changed after listing");
 			return target.id;
 		});
 
@@ -551,7 +537,7 @@ describe("runCli", () => {
 		);
 
 		expect(createAgent).toHaveBeenCalledOnce();
-		const { conversations } = await store.listConversations();
+		const { conversations } = await store.list();
 		expect(conversations).toContainEqual(
 			expect.objectContaining({
 				input: [
@@ -568,11 +554,9 @@ describe("runCli", () => {
 	it("loads the selected checkpoint and continues it with a recreated agent", async () => {
 		const { store } = await createStore();
 		const savedInput = [{ role: "user" as const, content: "saved request" }];
-		const saved = await store.commitCheckpoint(
-			await store.startRequest(store.createConversation(), "saved request"),
-			savedInput,
-			"old-model",
-		);
+		const saved = store.create();
+		await saved.startRequest("saved request");
+		await saved.commitCheckpoint(savedInput, "old-model");
 		const prompt = promptWith(["/history", "continued request", "quit"]);
 		const createAgent = vi.fn(successfulAgentFactory);
 		const seenChoices: unknown[] = [];
@@ -604,7 +588,7 @@ describe("runCli", () => {
 			[],
 			savedInput,
 		]);
-		expect((await store.loadConversation(saved.id)).input).toEqual([
+		expect((await store.load(saved.id)).input).toEqual([
 			...savedInput,
 			{ role: "user", content: "continued request" },
 		]);
@@ -623,7 +607,7 @@ describe("runCli", () => {
 		);
 
 		expect(createAgent.mock.calls.map(([input]) => input)).toEqual([[], []]);
-		const { conversations } = await store.listConversations();
+		const { conversations } = await store.list();
 		expect(conversations.map(({ input }) => input)).toEqual(
 			expect.arrayContaining([
 				[{ role: "user", content: "first request" }],
@@ -635,30 +619,19 @@ describe("runCli", () => {
 
 	it("persists pending and tool status before committing exact agent input", async () => {
 		const { store } = await createStore();
-		const agent = vi.fn(
-			async (
-				prompt: string,
-				_journal: Journal,
-				_requestNumber: number,
-				options: AgentRunOptions = {},
-			) => {
-				const pending = await store.loadConversation(
-					options.conversationId ?? "",
-				);
+		const agent = fakeAgent(
+			async (prompt: string, options: AgentRunOptions) => {
+				const pending = await store.load(options.conversationId ?? "");
 				expect(pending.pendingRequest?.prompt).toBe(prompt);
 
 				await options.onToolStarted?.({ callId: "call-1", name: "read" });
-				const started = await store.loadConversation(
-					options.conversationId ?? "",
-				);
+				const started = await store.load(options.conversationId ?? "");
 				expect(started.pendingRequest?.tools).toEqual([
 					{ callId: "call-1", name: "read", status: "started" },
 				]);
 
 				await options.onToolFinished?.("call-1");
-				const finished = await store.loadConversation(
-					options.conversationId ?? "",
-				);
+				const finished = await store.load(options.conversationId ?? "");
 				expect(finished.pendingRequest?.tools).toEqual([
 					{ callId: "call-1", name: "read", status: "finished" },
 				]);
@@ -679,7 +652,7 @@ describe("runCli", () => {
 			new EventEmitter(),
 		);
 
-		const { conversations } = await store.listConversations();
+		const { conversations } = await store.list();
 		expect(conversations).toHaveLength(1);
 		expect(conversations[0]).toMatchObject({
 			revision: 4,
@@ -691,44 +664,44 @@ describe("runCli", () => {
 
 	it("does not call the agent when pending state cannot be saved", async () => {
 		const { store } = await createStore();
-		const agent = vi.fn();
-		const failingStore = {
-			...store,
-			startRequest: vi.fn().mockRejectedValue(new Error("disk full")),
-		};
+		const agent = vi.fn(async (_prompt: string, _options: AgentRunOptions) => {
+			throw new Error("agent must not be called");
+		});
+		vi.spyOn(store, "save").mockRejectedValue(new Error("disk full"));
 
 		await runCli(
 			promptWith(["inspect", "quit"]),
 			journalWith(),
-			failingStore,
-			() => agent,
+			store,
+			() => fakeAgent(agent),
 			new EventEmitter(),
 		);
 
 		expect(agent).not.toHaveBeenCalled();
-		expect((await store.listConversations()).conversations).toEqual([]);
+		expect((await store.list()).conversations).toEqual([]);
 	});
 
 	it("blocks later requests until an unsaved checkpoint is persisted", async () => {
 		const { store } = await createStore();
 		let commitAttempts = 0;
-		const flakyStore = {
-			...store,
-			commitCheckpoint: async (
-				...args: Parameters<typeof store.commitCheckpoint>
-			) => {
-				commitAttempts++;
-				if (commitAttempts <= 2) throw new Error("disk full");
-				return store.commitCheckpoint(...args);
+		const save = store.save.bind(store);
+		vi.spyOn(store, "save").mockImplementation(
+			async (state, expectedRevision) => {
+				// A commit clears the pending request; compaction keeps it.
+				if (state.pendingRequest === null && expectedRevision > 0) {
+					commitAttempts++;
+					if (commitAttempts <= 2) throw new Error("disk full");
+				}
+				return save(state, expectedRevision);
 			},
-		};
-		const agent = vi.fn(successfulAgentFactory());
+		);
+		const agent = vi.fn(successfulAgentRunner());
 
 		await runCli(
 			promptWith(["first", "blocked", "third", "quit"]),
 			journalWith(),
-			flakyStore,
-			() => agent,
+			store,
+			() => fakeAgent(agent),
 			new EventEmitter(),
 		);
 
@@ -737,7 +710,7 @@ describe("runCli", () => {
 			"third",
 		]);
 		expect(commitAttempts).toBe(4);
-		const { conversations } = await store.listConversations();
+		const { conversations } = await store.list();
 		expect(conversations[0]).toMatchObject({
 			input: [
 				{ role: "user", content: "first" },
@@ -752,15 +725,20 @@ describe("runCli", () => {
 
 	it("warns when exiting with an unsaved checkpoint", async () => {
 		const { store } = await createStore();
-		const failingStore = {
-			...store,
-			commitCheckpoint: vi.fn().mockRejectedValue(new Error("disk full")),
-		};
+		const save = store.save.bind(store);
+		vi.spyOn(store, "save").mockImplementation(
+			async (state, expectedRevision) => {
+				if (state.pendingRequest === null && expectedRevision > 0) {
+					throw new Error("disk full");
+				}
+				return save(state, expectedRevision);
+			},
+		);
 
 		await runCli(
 			promptWith(["first", "quit"]),
 			journalWith(),
-			failingStore,
+			store,
 			successfulAgentFactory,
 			new EventEmitter(),
 		);
@@ -773,7 +751,14 @@ describe("runCli", () => {
 	it("leaves failed request metadata and starts the next request from checkpoint", async () => {
 		const { store } = await createStore();
 		const agent = vi
-			.fn()
+			.fn(
+				async (
+					_prompt: string,
+					_options: AgentRunOptions,
+				): Promise<AgentResult> => {
+					throw new Error("unexpected call");
+				},
+			)
 			.mockRejectedValueOnce(new Error("model failed"))
 			.mockResolvedValueOnce({
 				answer: "recovered",
@@ -785,7 +770,7 @@ describe("runCli", () => {
 			promptWith(["failed", "fresh", "quit"]),
 			journalWith(),
 			store,
-			() => agent,
+			() => fakeAgent(agent),
 			new EventEmitter(),
 		);
 
@@ -793,7 +778,7 @@ describe("runCli", () => {
 			"failed",
 			"fresh",
 		]);
-		const { conversations } = await store.listConversations();
+		const { conversations } = await store.list();
 		expect(conversations[0]).toMatchObject({
 			input: [{ role: "user", content: "fresh" }],
 			pendingRequest: null,
@@ -812,7 +797,7 @@ describe("runCli", () => {
 			new EventEmitter(),
 		);
 
-		expect((await store.listConversations()).conversations[0]).toMatchObject({
+		expect((await store.list()).conversations[0]).toMatchObject({
 			input: [{ role: "user", content: "persist me" }],
 			pendingRequest: null,
 		});
@@ -831,7 +816,7 @@ describe("runCli", () => {
 			new EventEmitter(),
 		);
 
-		expect((await store.listConversations()).conversations[0]).toMatchObject({
+		expect((await store.list()).conversations[0]).toMatchObject({
 			input: [{ role: "user", content: "persist me" }],
 			pendingRequest: null,
 		});
@@ -854,7 +839,7 @@ describe("runCli", () => {
 		expect(result).toEqual({ interrupted: true });
 		expect(prompt.close).toHaveBeenCalledOnce();
 		expect(finish).toHaveBeenCalledWith({ requestCount: 0 });
-		expect((await store.listConversations()).conversations).toEqual([]);
+		expect((await store.list()).conversations).toEqual([]);
 	});
 
 	it("awaits a sealed journal finish when SIGINT interrupts a request", async () => {
@@ -868,14 +853,17 @@ describe("runCli", () => {
 		);
 		const prompt = promptWith(["inspect repository"]);
 		const signals = new EventEmitter();
-		const agent = vi.fn(() => new Promise<never>(() => {}));
+		const agent = vi.fn(
+			async (_prompt: string, _options: AgentRunOptions) =>
+				new Promise<never>(() => {}),
+		);
 		let settled = false;
 
 		const resultPromise = runCli(
 			prompt,
 			journalWith(vi.fn(), finish),
 			store,
-			() => agent,
+			() => fakeAgent(agent),
 			signals,
 		).then((result) => {
 			settled = true;
@@ -897,13 +885,16 @@ describe("runCli", () => {
 		const { store } = await createStore();
 		const prompt = promptWith(["inspect repository"]);
 		const signals = new EventEmitter();
-		const agent = vi.fn(() => new Promise<never>(() => {}));
+		const agent = vi.fn(
+			async (_prompt: string, _options: AgentRunOptions) =>
+				new Promise<never>(() => {}),
+		);
 
 		const resultPromise = runCli(
 			prompt,
 			journalWith(),
 			store,
-			() => agent,
+			() => fakeAgent(agent),
 			signals,
 		);
 		await vi.waitFor(() => expect(agent).toHaveBeenCalledOnce());
@@ -912,7 +903,7 @@ describe("runCli", () => {
 		const result = await resultPromise;
 
 		expect(result).toEqual({ interrupted: true });
-		const { conversations } = await store.listConversations();
+		const { conversations } = await store.list();
 		expect(conversations[0]).toMatchObject({
 			input: [],
 			pendingRequest: {

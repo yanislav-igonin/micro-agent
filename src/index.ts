@@ -4,11 +4,11 @@ import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
 
 import { runCli } from "./cli.js";
-import { createConversationStore } from "./conversations.js";
+import { ConversationStore } from "./conversations.js";
 import { createJournal } from "./journal.js";
 
 const journal = await createJournal(!process.argv.includes("--no-log"));
-const conversationStore = await createConversationStore();
+const conversationStore = await ConversationStore.open();
 await journal.record("cli_started", {});
 
 const rl = createInterface({

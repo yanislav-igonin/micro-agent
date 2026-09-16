@@ -19,7 +19,7 @@ vi.mock("openai", () => ({
 	},
 }));
 
-import { createAgent } from "./agent.js";
+import { Agent } from "./agent.js";
 
 const artifacts: string[] = [];
 
@@ -68,14 +68,16 @@ afterEach(async () => {
 	);
 });
 
-describe("createAgent", () => {
+describe("Agent.run", () => {
 	it("never compacts without a configured context budget", async () => {
 		openai.create.mockResolvedValue({
 			output: [assistantMessage("no-budget", "done")],
 			output_text: "done",
 			usage: { input_tokens: 90_000 },
 		});
-		await createAgent()("goal", journalWith(), 1, {
+		await new Agent().run("goal", {
+			journal: journalWith(),
+			requestNumber: 1,
 			onCompacted: async () => {},
 		});
 		expect(openai.count).not.toHaveBeenCalled();
@@ -108,11 +110,11 @@ describe("createAgent", () => {
 		const onCompacted = vi.fn(async () => {
 			sequence.push("save");
 		});
-		await createAgent([{ role: "user", content: "old goal PRI-296" }])(
+		await new Agent([{ role: "user", content: "old goal PRI-296" }]).run(
 			"continue",
-			journalWith(),
-			1,
 			{
+				journal: journalWith(),
+				requestNumber: 1,
 				contextBudget: 100,
 				onCompacted,
 			},
@@ -133,11 +135,13 @@ describe("createAgent", () => {
 	it("keeps the stable input on compact API failure and makes no model call", async () => {
 		openai.count.mockResolvedValue({ input_tokens: 80 });
 		openai.compact.mockRejectedValueOnce(new Error("compact failed"));
-		const agent = createAgent([{ role: "user", content: "stable" }]);
+		const agent = new Agent([{ role: "user", content: "stable" }]);
 		const records: Array<{ type: string; data: unknown; context: unknown }> =
 			[];
 		await expect(
-			agent("first", journalWith(records), 1, {
+			agent.run("first", {
+				journal: journalWith(records),
+				requestNumber: 1,
 				contextBudget: 100,
 				onCompacted: async () => {},
 			}),
@@ -165,7 +169,9 @@ describe("createAgent", () => {
 			output: [assistantMessage("after", "done")],
 			output_text: "done",
 		});
-		await agent("fresh", journalWith(), 2, {
+		await agent.run("fresh", {
+			journal: journalWith(),
+			requestNumber: 2,
 			contextBudget: 100,
 			onCompacted: async () => {},
 		});
@@ -184,7 +190,9 @@ describe("createAgent", () => {
 		});
 		const onCompacted = vi.fn();
 		await expect(
-			createAgent()("goal", journalWith(), 1, {
+			new Agent().run("goal", {
+				journal: journalWith(),
+				requestNumber: 1,
 				contextBudget: 100,
 				onCompacted,
 			}),
@@ -208,7 +216,9 @@ describe("createAgent", () => {
 		});
 		const onCompacted = vi.fn();
 		await expect(
-			createAgent()("goal", journalWith(), 1, {
+			new Agent().run("goal", {
+				journal: journalWith(),
+				requestNumber: 1,
 				contextBudget: 100,
 				onCompacted,
 			}),
@@ -232,7 +242,9 @@ describe("createAgent", () => {
 		const records: Array<{ type: string; data: unknown; context: unknown }> =
 			[];
 		await expect(
-			createAgent()("goal", journalWith(records), 1, {
+			new Agent().run("goal", {
+				journal: journalWith(records),
+				requestNumber: 1,
 				contextBudget: 100,
 				onCompacted,
 			}),
@@ -284,11 +296,14 @@ describe("createAgent", () => {
 			usage: { input_tokens: 80_000 },
 		});
 		const onCompacted = vi.fn(async () => {});
-		await createAgent()(
+		await new Agent().run(
 			"Goal: fix PRI-296. Decision: keep existing files. Plan: verify src/agent.ts. Failure: typecheck failed. Side effect of uncertain-call unknown.",
-			journalWith(records),
-			1,
-			{ contextBudget: 100_000, onCompacted },
+			{
+				journal: journalWith(records),
+				requestNumber: 1,
+				contextBudget: 100_000,
+				onCompacted,
+			},
 		);
 		expect(openai.create).toHaveBeenCalledTimes(2);
 		expect(openai.compact).toHaveBeenCalledOnce();
@@ -328,12 +343,16 @@ describe("createAgent", () => {
 			output_text: "done",
 			usage: { input_tokens: 100 },
 		});
-		const agent = createAgent([{ role: "user", content: "x".repeat(90_000) }]);
-		await agent("first", journalWith(), 1, {
+		const agent = new Agent([{ role: "user", content: "x".repeat(90_000) }]);
+		await agent.run("first", {
+			journal: journalWith(),
+			requestNumber: 1,
 			contextBudget: 100_000,
 			onCompacted: async () => {},
 		});
-		await agent("later", journalWith(), 2, {
+		await agent.run("later", {
+			journal: journalWith(),
+			requestNumber: 2,
 			contextBudget: 100_000,
 			onCompacted: async () => {},
 		});
@@ -346,7 +365,9 @@ describe("createAgent", () => {
 			.fn()
 			.mockRejectedValue(new Error("Started tool blocks the next model step"));
 		await expect(
-			createAgent()("goal", journalWith(), 1, {
+			new Agent().run("goal", {
+				journal: journalWith(),
+				requestNumber: 1,
 				contextBudget: 100,
 				onModelStepBoundary,
 				onCompacted: async () => {},
@@ -362,7 +383,9 @@ describe("createAgent", () => {
 			output_text: "done",
 			usage: { input_tokens: 120 },
 		});
-		await createAgent()("small", journalWith(), 1, {
+		await new Agent().run("small", {
+			journal: journalWith(),
+			requestNumber: 1,
 			contextBudget: 100_000,
 		});
 		expect(openai.count).not.toHaveBeenCalled();
@@ -388,7 +411,9 @@ describe("createAgent", () => {
 				output_text: "done",
 			});
 		openai.count.mockResolvedValue({ input_tokens: 80_050 });
-		await createAgent()("step", journalWith(), 1, {
+		await new Agent().run("step", {
+			journal: journalWith(),
+			requestNumber: 1,
 			contextBudget: 100_000,
 		});
 		expect(openai.count).toHaveBeenCalledOnce();
@@ -401,9 +426,17 @@ describe("createAgent", () => {
 			output_text: "done",
 			usage: { input_tokens: 150 },
 		}));
-		const agent = createAgent();
-		await agent("first", journalWith(), 1, { contextBudget: 100_000 });
-		await agent("second", journalWith(), 2, { contextBudget: 100_000 });
+		const agent = new Agent();
+		await agent.run("first", {
+			journal: journalWith(),
+			requestNumber: 1,
+			contextBudget: 100_000,
+		});
+		await agent.run("second", {
+			journal: journalWith(),
+			requestNumber: 2,
+			contextBudget: 100_000,
+		});
 		expect(openai.count).not.toHaveBeenCalled();
 		expect(openai.create).toHaveBeenCalledTimes(2);
 	});
@@ -421,10 +454,14 @@ describe("createAgent", () => {
 			};
 		});
 		openai.count.mockResolvedValue({ input_tokens: 2 });
-		const agent = createAgent();
-		await agent("first", journalWith(), 1);
+		const agent = new Agent();
+		await agent.run("first", { journal: journalWith(), requestNumber: 1 });
 		const budget = Math.ceil((firstRequestBytes + 1) / 0.8);
-		await agent("second", journalWith(), 2, { contextBudget: budget });
+		await agent.run("second", {
+			journal: journalWith(),
+			requestNumber: 2,
+			contextBudget: budget,
+		});
 		expect(openai.count).toHaveBeenCalledOnce();
 	});
 
@@ -436,10 +473,18 @@ describe("createAgent", () => {
 			usage: { input_tokens: 150 },
 		}));
 		openai.count.mockResolvedValue({ input_tokens: 200 });
-		const agent = createAgent();
-		await agent("first", journalWith(), 1, { contextBudget: 100_000 });
+		const agent = new Agent();
+		await agent.run("first", {
+			journal: journalWith(),
+			requestNumber: 1,
+			contextBudget: 100_000,
+		});
 		process.env.OPENAI_MODEL = "model-b";
-		await agent("second", journalWith(), 2, { contextBudget: 100_000 });
+		await agent.run("second", {
+			journal: journalWith(),
+			requestNumber: 2,
+			contextBudget: 100_000,
+		});
 		expect(openai.count).toHaveBeenCalledOnce();
 		expect(openai.count.mock.calls[0]?.[0].model).toBe("model-b");
 	});
@@ -460,7 +505,9 @@ describe("createAgent", () => {
 			};
 		});
 		const onContextMeasured = vi.fn();
-		await createAgent()("risk", journalWith(), 1, {
+		await new Agent().run("risk", {
+			journal: journalWith(),
+			requestNumber: 1,
 			contextBudget: 100,
 			onContextMeasured,
 		});
@@ -490,17 +537,23 @@ describe("createAgent", () => {
 				output_text: "done",
 			};
 		});
-		const agent = createAgent([{ role: "user", content: "stable" }]);
+		const agent = new Agent([{ role: "user", content: "stable" }]);
 		const onContextMeasured = vi.fn();
 		await expect(
-			agent("blocked", journalWith(), 1, {
+			agent.run("blocked", {
+				journal: journalWith(),
+				requestNumber: 1,
 				contextBudget: 100,
 				onContextMeasured,
 			}),
 		).rejects.toThrow("Context Budget");
 		expect(openai.create).not.toHaveBeenCalled();
 		expect(onContextMeasured).toHaveBeenCalledWith(101);
-		await agent("fresh", journalWith(), 2, { contextBudget: 100 });
+		await agent.run("fresh", {
+			journal: journalWith(),
+			requestNumber: 2,
+			contextBudget: 100,
+		});
 		expect(createdInput).toEqual([
 			{ role: "user", content: "stable" },
 			{ role: "user", content: "fresh" },
@@ -513,7 +566,9 @@ describe("createAgent", () => {
 			output: [assistantMessage("at-budget", "done")],
 			output_text: "done",
 		});
-		await createAgent()("at budget", journalWith(), 1, {
+		await new Agent().run("at budget", {
+			journal: journalWith(),
+			requestNumber: 1,
 			contextBudget: 100,
 		});
 		expect(openai.create).toHaveBeenCalledOnce();
@@ -533,9 +588,11 @@ describe("createAgent", () => {
 				output_text: "done",
 			};
 		});
-		const agent = createAgent([{ role: "user", content: "stable" }]);
+		const agent = new Agent([{ role: "user", content: "stable" }]);
 		await expect(
-			agent("large", journalWith(records), 1, {
+			agent.run("large", {
+				journal: journalWith(records),
+				requestNumber: 1,
 				contextBudget: 100,
 			}),
 		).rejects.toThrow("count failed");
@@ -545,7 +602,11 @@ describe("createAgent", () => {
 		).toMatchObject({
 			phase: "input_token_count",
 		});
-		await agent("fresh", journalWith(), 2, { contextBudget: 100 });
+		await agent.run("fresh", {
+			journal: journalWith(),
+			requestNumber: 2,
+			contextBudget: 100,
+		});
 		expect(recoveredInput).toEqual([
 			{ role: "user", content: "stable" },
 			{ role: "user", content: "fresh" },
@@ -563,9 +624,11 @@ describe("createAgent", () => {
 			output_text: "done",
 		}));
 		const onContextWarning = vi.fn();
-		const agent = createAgent();
+		const agent = new Agent();
 		for (const prompt of ["one", "two", "three", "four"]) {
-			await agent(prompt, journalWith(), 1, {
+			await agent.run(prompt, {
+				journal: journalWith(),
+				requestNumber: 1,
 				contextBudget: 100,
 				onContextWarning,
 			});
@@ -583,7 +646,11 @@ describe("createAgent", () => {
 			usage: { input_tokens: 321 },
 		});
 		const onContextMeasured = vi.fn();
-		await createAgent()("measure", journalWith(), 1, { onContextMeasured });
+		await new Agent().run("measure", {
+			journal: journalWith(),
+			requestNumber: 1,
+			onContextMeasured,
+		});
 		expect(onContextMeasured).toHaveBeenCalledOnce();
 		expect(onContextMeasured).toHaveBeenCalledWith(321);
 	});
@@ -594,7 +661,11 @@ describe("createAgent", () => {
 			output_text: "done",
 		});
 		const onContextMeasured = vi.fn();
-		await createAgent()("measure", journalWith(), 1, { onContextMeasured });
+		await new Agent().run("measure", {
+			journal: journalWith(),
+			requestNumber: 1,
+			onContextMeasured,
+		});
 		expect(onContextMeasured).not.toHaveBeenCalled();
 	});
 
@@ -617,12 +688,11 @@ describe("createAgent", () => {
 			};
 		});
 
-		const result = await createAgent(restoredInput)(
-			"new request",
-			journalWith(records),
-			1,
-			{ conversationId: "a1b2c3d4e5f6" },
-		);
+		const result = await new Agent(restoredInput).run("new request", {
+			journal: journalWith(records),
+			requestNumber: 1,
+			conversationId: "a1b2c3d4e5f6",
+		});
 
 		const expectedInput = [
 			...restoredInput,
@@ -691,16 +761,20 @@ describe("createAgent", () => {
 			}
 			return { output: [finalAnswer], output_text: "recovered" };
 		});
-		const agent = createAgent(restoredInput);
+		const agent = new Agent(restoredInput);
 
 		await expect(
-			agent("failed request", journalWith(), 1, {
+			agent.run("failed request", {
+				journal: journalWith(),
+				requestNumber: 1,
 				conversationId: "a1b2c3d4e5f6",
 				onToolStarted: async () => {},
 				onToolFinished: async () => {},
 			}),
 		).rejects.toThrow("model failed");
-		await agent("fresh request", journalWith(), 2, {
+		await agent.run("fresh request", {
+			journal: journalWith(),
+			requestNumber: 2,
 			conversationId: "a1b2c3d4e5f6",
 		});
 
@@ -726,7 +800,7 @@ describe("createAgent", () => {
 
 	it("cancels an active model request without advancing its checkpoint", async () => {
 		const controller = new AbortController();
-		const agent = createAgent([{ role: "user", content: "stable" }]);
+		const agent = new Agent([{ role: "user", content: "stable" }]);
 		const records: Array<{ type: string; data: unknown; context: unknown }> =
 			[];
 		let freshRequestInput: unknown;
@@ -749,7 +823,9 @@ describe("createAgent", () => {
 				};
 			});
 
-		const interrupted = agent("interrupted", journalWith(records), 1, {
+		const interrupted = agent.run("interrupted", {
+			journal: journalWith(records),
+			requestNumber: 1,
 			conversationId: "a1b2c3d4e5f6",
 			signal: controller.signal,
 		});
@@ -760,7 +836,9 @@ describe("createAgent", () => {
 
 		await interruptedExpectation;
 		expect(records.at(-1)?.data).toMatchObject({ reason: "cancelled" });
-		await agent("fresh", journalWith(), 2, {
+		await agent.run("fresh", {
+			journal: journalWith(),
+			requestNumber: 2,
 			conversationId: "a1b2c3d4e5f6",
 		});
 		expect(freshRequestInput).toEqual([
@@ -786,7 +864,9 @@ describe("createAgent", () => {
 			});
 		const order: string[] = [];
 
-		await createAgent()("write it", journalWith(), 1, {
+		await new Agent().run("write it", {
+			journal: journalWith(),
+			requestNumber: 1,
 			conversationId: "a1b2c3d4e5f6",
 			onToolStarted: async (tool) => {
 				order.push(`started:${tool.callId}:${tool.name}`);
@@ -817,7 +897,9 @@ describe("createAgent", () => {
 		});
 
 		await expect(
-			createAgent()("write it", journalWith(), 1, {
+			new Agent().run("write it", {
+				journal: journalWith(),
+				requestNumber: 1,
 				conversationId: "a1b2c3d4e5f6",
 				onToolStarted: async () => {
 					throw new Error("state save failed");
@@ -852,7 +934,9 @@ describe("createAgent", () => {
 			output_text: "",
 		});
 
-		const interrupted = createAgent()("write it", journalWith(), 1, {
+		const interrupted = new Agent().run("write it", {
+			journal: journalWith(),
+			requestNumber: 1,
 			conversationId: "a1b2c3d4e5f6",
 			signal: controller.signal,
 			onToolStarted,
@@ -886,10 +970,12 @@ describe("createAgent", () => {
 					output_text: "fresh",
 				};
 			});
-		const agent = createAgent();
+		const agent = new Agent();
 
 		await expect(
-			agent("failed", journalWith(), 1, {
+			agent.run("failed", {
+				journal: journalWith(),
+				requestNumber: 1,
 				conversationId: "a1b2c3d4e5f6",
 				onToolStarted: async () => {},
 				onToolFinished: async () => {
@@ -900,7 +986,9 @@ describe("createAgent", () => {
 		expect(await fs.readFile(artifact, "utf8")).toBe("written");
 		expect(openai.create).toHaveBeenCalledOnce();
 
-		await agent("fresh", journalWith(), 2, {
+		await agent.run("fresh", {
+			journal: journalWith(),
+			requestNumber: 2,
 			conversationId: "a1b2c3d4e5f6",
 		});
 		expect(freshRequestInput).toEqual([{ role: "user", content: "fresh" }]);
@@ -929,7 +1017,9 @@ describe("createAgent", () => {
 				};
 			});
 
-		await createAgent()("run it", journalWith(records), 1, {
+		await new Agent().run("run it", {
+			journal: journalWith(records),
+			requestNumber: 1,
 			onToolStarted: async () => {},
 			onToolFinished: async () => {},
 		});
